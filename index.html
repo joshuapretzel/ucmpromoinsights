@@ -88,8 +88,9 @@ import {
 import { createClient } from "@supabase/supabase-js";
 var DATA_SOURCE = "supabase";
 var DEMO_MODE = DATA_SOURCE === "demo";
-var SUPABASE_URL = "https://jatjpqefpgxgaumvlqef.supabase.co";
-var SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImphdGpwcWVmcGd4Z2F1bXZscWVmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkxODAxNjYsImV4cCI6MjA5NDc1NjE2Nn0.Lr4jatuxh0tjIlEUtZc6r4zO1yze_1tH16Thh1E05jU";
+var IS_LOCAL = typeof window !== "undefined" && ["localhost", "127.0.0.1"].includes(window.location.hostname);
+var SUPABASE_URL = IS_LOCAL ? "http://127.0.0.1:54321" : "https://jatjpqefpgxgaumvlqef.supabase.co";
+var SUPABASE_ANON_KEY = IS_LOCAL ? "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0" : "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImphdGpwcWVmcGd4Z2F1bXZscWVmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkxODAxNjYsImV4cCI6MjA5NDc1NjE2Nn0.Lr4jatuxh0tjIlEUtZc6r4zO1yze_1tH16Thh1E05jU";
 var supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
 });
@@ -286,6 +287,142 @@ var SupabaseAPI = {
     if (error) throw new Error(error.message);
     return data;
   },
+  // -- STORES (physical counters/booths within a promotion) ---
+  listStores: async (promotionId) => {
+    if (!promotionId) return [];
+    const { data, error } = await supabase.from("stores").select("*").eq("promotion_id", promotionId).order("name");
+    if (error) throw new Error(error.message);
+    return data || [];
+  },
+  createStore: async (promotionId, name) => {
+    const { data, error } = await supabase.from("stores").insert({ promotion_id: promotionId, name: name.trim() }).select().single();
+    if (error) throw new Error(error.message);
+    return data;
+  },
+  // Names arrive from the CSV's "Job Title", which is often not what ops wants
+  // to see on a dashboard — so they're editable by hand.
+  renameStore: async (id, name) => {
+    const { data, error } = await supabase.from("stores").update({ name: name.trim() }).eq("id", id).select().single();
+    if (error) throw new Error(error.message);
+    return data;
+  },
+  deleteStore: async (id) => {
+    const { error } = await supabase.from("stores").delete().eq("id", id);
+    if (error) throw new Error(error.message);
+    return true;
+  },
+  // -- TEAM & ACCESS (profiles) -------------------------------
+  // Everyone who has signed up, so a manager can approve them in-app instead of
+  // an admin editing the profiles table in the Supabase dashboard.
+  listProfiles: async () => {
+    const { data, error } = await supabase.from("profiles").select("id, email, full_name, role, created_at").order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+    return data || [];
+  },
+  // Goes through app_set_user_role, which enforces who may grant what — the UI
+  // disabling a dropdown is a convenience, not the actual protection.
+  setUserRole: async (userId, role) => {
+    const { error } = await supabase.rpc("app_set_user_role", { target_user: userId, new_role: role || null });
+    if (error) throw new Error(error.message);
+    return true;
+  },
+  // -- SCHEDULED SHIFTS (store_shifts) ------------------------
+  // The planned roster: a store has shifts, and promoters get assigned to them.
+  // Note these are NOT the `shifts` table, which holds one promoter's report
+  // for one day and hangs off a scheduled shift via shifts.store_shift_id.
+  listStoreShifts: async (promotionId) => {
+    if (!promotionId) return [];
+    const storeIds = (await SupabaseAPI.listStores(promotionId)).map((s) => s.id);
+    if (storeIds.length === 0) return [];
+    const { data, error } = await supabase.from("store_shifts").select("*, shift_assignments(promoter_id, promoters(id, name, email))").in("store_id", storeIds).order("shift_date").order("start_time");
+    if (error) throw new Error(error.message);
+    return data || [];
+  },
+  createStoreShift: async (storeId, { date, start = null, end = null, slots = 1 }) => {
+    const { data, error } = await supabase.from("store_shifts").insert({ store_id: storeId, shift_date: date, start_time: start, end_time: end, slots }).select().single();
+    if (error) throw new Error(error.message);
+    return data;
+  },
+  deleteStoreShift: async (id) => {
+    const { error } = await supabase.from("store_shifts").delete().eq("id", id);
+    if (error) throw new Error(error.message);
+    return true;
+  },
+  assignShift: async (storeShiftId, promoterId) => {
+    const { error } = await supabase.from("shift_assignments").upsert({ store_shift_id: storeShiftId, promoter_id: promoterId }, { onConflict: "store_shift_id,promoter_id" });
+    if (error) throw new Error(error.message);
+    return true;
+  },
+  unassignShift: async (storeShiftId, promoterId) => {
+    const { error } = await supabase.from("shift_assignments").delete().eq("store_shift_id", storeShiftId).eq("promoter_id", promoterId);
+    if (error) throw new Error(error.message);
+    return true;
+  },
+  // Bulk import from the jobs CSV. Stores are matched by name so a re-import
+  // doesn't duplicate them; shifts are always inserted (the caller warns about
+  // likely duplicates first).
+  importJobsCSV: async (promotionId, parsed) => {
+    if (!promotionId) throw new Error("No promotion selected");
+    const existing = await SupabaseAPI.listStores(promotionId);
+    const byName = new Map(existing.map((s) => [s.name, s]));
+    let storesCreated = 0;
+    const rows = [];
+    for (const store of parsed.stores || []) {
+      let match = byName.get(store.name);
+      if (!match) {
+        match = await SupabaseAPI.createStore(promotionId, store.name);
+        byName.set(store.name, match);
+        storesCreated++;
+      }
+      for (const sh of store.shifts || []) {
+        rows.push({ store_id: match.id, shift_date: sh.date, start_time: sh.start, end_time: sh.end, slots: sh.slots });
+      }
+    }
+    if (rows.length > 0) {
+      const { error } = await supabase.from("store_shifts").insert(rows);
+      if (error) throw new Error(error.message);
+    }
+    return { storesCreated, storesMatched: (parsed.stores || []).length - storesCreated, shiftsInserted: rows.length };
+  },
+  // The reporting gate: does this promoter have a shift scheduled today on this
+  // promotion? Day-level only — we deliberately don't check the clock, so a
+  // late finish or an early start doesn't lock someone out of their own report.
+  // Both of these query store_shifts as the primary table and reach the
+  // promoter/promotion through inner-joined embeds. Going the other way round
+  // (from shift_assignments) can't order by the shift date, because PostgREST
+  // orders embedded rows rather than the parent.
+  findTodaysAssignedShift: async (promotionId, promoterId) => {
+    if (!promotionId || !promoterId) return null;
+    const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    const { data, error } = await supabase.from("store_shifts").select("id, shift_date, start_time, end_time, store_id, shift_assignments!inner(promoter_id), stores!inner(id, name, promotion_id)").eq("shift_assignments.promoter_id", promoterId).eq("stores.promotion_id", promotionId).eq("shift_date", today).limit(1);
+    if (error) throw new Error(error.message);
+    const ss = (data || [])[0];
+    if (!ss) return null;
+    return {
+      storeShiftId: ss.id,
+      storeId: ss.store_id,
+      storeName: ss.stores ? ss.stores.name : null,
+      shiftDate: ss.shift_date,
+      startTime: ss.start_time,
+      endTime: ss.end_time
+    };
+  },
+  // Next scheduled shift after today — shown on the "no shift today" screen so
+  // the promoter knows when they're next expected.
+  findNextAssignedShift: async (promotionId, promoterId) => {
+    if (!promotionId || !promoterId) return null;
+    const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    const { data, error } = await supabase.from("store_shifts").select("id, shift_date, start_time, end_time, shift_assignments!inner(promoter_id), stores!inner(name, promotion_id)").eq("shift_assignments.promoter_id", promoterId).eq("stores.promotion_id", promotionId).gt("shift_date", today).order("shift_date", { ascending: true }).limit(1);
+    if (error) return null;
+    const ss = (data || [])[0];
+    if (!ss) return null;
+    return {
+      shiftDate: ss.shift_date,
+      startTime: ss.start_time,
+      endTime: ss.end_time,
+      storeName: ss.stores ? ss.stores.name : null
+    };
+  },
   // -- CLIENT ACCESS (client_promotions join) ----------------
   // List the promotions a given client account is linked to. Used by the
   // client report to scope the view to only that client's campaigns.
@@ -350,6 +487,8 @@ var SupabaseAPI = {
     return data || null;
   },
   // -- PROMOTER ASSIGNMENTS (write) --------------------------
+  // Promotion-level only. Which store a promoter works is decided per shift
+  // (shift_assignments -> store_shifts -> stores), not here.
   assignPromoter: async (promotionId, promoterId) => {
     const { data, error } = await supabase.from("promoter_assignments").upsert({ promotion_id: promotionId, promoter_id: promoterId }, { onConflict: "promotion_id,promoter_id" }).select().maybeSingle();
     if (error) throw new Error(error.message);
@@ -400,7 +539,7 @@ var SupabaseAPI = {
       field_type: body.field_type,
       client_visible: body.client_visible ?? true,
       position: body.position ?? 0,
-      section: body.section || "contact"
+      section: body.section || "shift"
     };
     if (body.field_type === "multi_choice") {
       row.choices = Array.isArray(body.choices) ? body.choices : [];
@@ -510,6 +649,17 @@ var SupabaseAPI = {
     const patch = {
       checklist_complete: !!(checklist && checklist.photo && checklist.stockConfirmed && checklist.briefingRead),
       briefing_read: !!(checklist && checklist.briefingRead)
+    };
+    const { error } = await supabase.from("shifts").update(patch).eq("id", shiftId);
+    if (error) throw new Error(error.message);
+  },
+  // The two tap counters. Written straight onto the promoter's shift row, which
+  // already carries store_id, so the totals attribute to a store for free.
+  saveCounters: async (shiftId, counters) => {
+    if (!shiftId) return;
+    const patch = {
+      contacts_total: Math.max(0, Number(counters && counters.approached) || 0),
+      raffle_entries: Math.max(0, Number(counters && counters.raffle) || 0)
     };
     const { error } = await supabase.from("shifts").update(patch).eq("id", shiftId);
     if (error) throw new Error(error.message);
@@ -663,12 +813,27 @@ var SupabaseAPI = {
     if (error) throw new Error(error.message);
     return data;
   },
-  findOrCreateActiveShift: async (promotionId, promoterId) => {
+  // Open (or reopen) the promoter's report row for a shift they're scheduled
+  // on. This no longer invents a shift out of thin air — the caller has already
+  // confirmed a scheduled shift exists for today, and the store comes from it.
+  //
+  // The upsert leans on the shifts_promoter_day_uniq index: two effect runs
+  // firing at once now converge on the same row instead of racing to insert two.
+  findOrCreateReportForShift: async (promotionId, promoterId, storeShift) => {
     const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
-    const { data: existing, error: e1 } = await supabase.from("shifts").select("*").eq("promotion_id", promotionId).eq("promoter_id", promoterId).eq("shift_date", today).in("status", ["planned", "active"]).limit(1);
+    const { data: existing, error: e1 } = await supabase.from("shifts").select("*").eq("promotion_id", promotionId).eq("promoter_id", promoterId).eq("shift_date", today).limit(1);
     if (e1) throw new Error(e1.message);
     if (existing && existing[0]) return existing[0];
-    const { data, error } = await supabase.from("shifts").insert({ promotion_id: promotionId, promoter_id: promoterId, shift_date: today, status: "active", start_time: (/* @__PURE__ */ new Date()).toISOString() }).select().single();
+    const payload = {
+      promotion_id: promotionId,
+      promoter_id: promoterId,
+      store_id: storeShift ? storeShift.storeId : null,
+      store_shift_id: storeShift ? storeShift.storeShiftId : null,
+      shift_date: today,
+      status: "active",
+      start_time: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    const { data, error } = await supabase.from("shifts").upsert(payload, { onConflict: "promoter_id,promotion_id,shift_date" }).select().single();
     if (error) throw new Error(error.message);
     return data;
   },
@@ -941,7 +1106,7 @@ function useJobDynamicFields(jobUuid) {
       clientVisible: row.client_visible !== false,
       // Default to 'contact' so rows that pre-date the section column
       // keep their existing per-contact behaviour.
-      section: row.section || "contact",
+      section: row.section || "shift",
       response: "\u2014",
       raw: row
     })) : null;
@@ -1010,6 +1175,27 @@ function useProductsLive() {
 }
 function usePromotionProductsLive(promotionId) {
   const fetcher = useMemo(() => () => promotionId ? SupabaseAPI.listPromotionProducts(promotionId) : Promise.resolve([]), [promotionId]);
+  const live = useFalcon(fetcher, [promotionId]);
+  if (DATA_SOURCE !== "supabase") return { data: null, loading: false, error: null, reload: () => {
+  } };
+  return live;
+}
+function useStoreShifts(promotionId) {
+  const fetcher = useMemo(() => () => promotionId ? SupabaseAPI.listStoreShifts(promotionId) : Promise.resolve([]), [promotionId]);
+  const live = useFalcon(fetcher, [promotionId]);
+  if (DATA_SOURCE !== "supabase") return { data: null, loading: false, error: null, reload: () => {
+  } };
+  return live;
+}
+function useProfiles() {
+  const fetcher = useMemo(() => () => SupabaseAPI.listProfiles(), []);
+  const live = useFalcon(fetcher, []);
+  if (DATA_SOURCE !== "supabase") return { data: null, loading: false, error: null, reload: () => {
+  } };
+  return live;
+}
+function useStores(promotionId) {
+  const fetcher = useMemo(() => () => promotionId ? SupabaseAPI.listStores(promotionId) : Promise.resolve([]), [promotionId]);
   const live = useFalcon(fetcher, [promotionId]);
   if (DATA_SOURCE !== "supabase") return { data: null, loading: false, error: null, reload: () => {
   } };
@@ -1380,10 +1566,10 @@ function useDashboardMetrics(promotionId) {
   return { shifts, sales, notes, interactions, loading, error, reload };
 }
 function useActiveShift(email, promotionId) {
-  const [state, setState] = useState({ shiftId: null, promoterId: null, promoter: null, promotionId: null, loading: false, error: null });
+  const [state, setState] = useState({ shiftId: null, promoterId: null, promoter: null, promotionId: null, storeShift: null, nextShift: null, loading: false, error: null });
   useEffect(() => {
     if (DATA_SOURCE !== "supabase" || !email || !promotionId) {
-      setState({ shiftId: null, promoterId: null, promoter: null, promotionId: promotionId || null, loading: false, error: null });
+      setState({ shiftId: null, promoterId: null, promoter: null, promotionId: promotionId || null, storeShift: null, nextShift: null, loading: false, error: null });
       return;
     }
     let cancelled = false;
@@ -1393,21 +1579,30 @@ function useActiveShift(email, promotionId) {
         const prom = await SupabaseAPI.findPromoterByEmail(email);
         if (!prom) {
           if (cancelled) return;
-          setState({ shiftId: null, promoterId: null, promoter: null, promotionId, loading: false, error: "not_a_promoter" });
+          setState({ shiftId: null, promoterId: null, promoter: null, promotionId, storeShift: null, nextShift: null, loading: false, error: "not_a_promoter" });
           return;
         }
         const isAssigned = await SupabaseAPI.isPromoterAssigned(promotionId, prom.id);
         if (!isAssigned) {
           if (cancelled) return;
-          setState({ shiftId: null, promoterId: prom.id, promoter: prom, promotionId, loading: false, error: "not_assigned" });
+          setState({ shiftId: null, promoterId: prom.id, promoter: prom, promotionId, storeShift: null, nextShift: null, loading: false, error: "not_assigned" });
           return;
         }
-        const shift = await SupabaseAPI.findOrCreateActiveShift(promotionId, prom.id);
+        // Reporting is gated on an actual scheduled shift for today. No shift,
+        // no report row — we don't create one speculatively any more.
+        const storeShift = await SupabaseAPI.findTodaysAssignedShift(promotionId, prom.id);
+        if (!storeShift) {
+          const nextShift = await SupabaseAPI.findNextAssignedShift(promotionId, prom.id);
+          if (cancelled) return;
+          setState({ shiftId: null, promoterId: prom.id, promoter: prom, promotionId, storeShift: null, nextShift, loading: false, error: "no_shift_today" });
+          return;
+        }
+        const shift = await SupabaseAPI.findOrCreateReportForShift(promotionId, prom.id, storeShift);
         if (cancelled) return;
-        setState({ shiftId: shift.id, promoterId: prom.id, promoter: prom, promotionId, loading: false, error: null });
+        setState({ shiftId: shift.id, promoterId: prom.id, promoter: prom, promotionId, storeShift, nextShift: null, loading: false, error: null });
       } catch (err) {
         if (cancelled) return;
-        setState({ shiftId: null, promoterId: null, promoter: null, promotionId, loading: false, error: err && err.message ? err.message : String(err) });
+        setState({ shiftId: null, promoterId: null, promoter: null, promotionId, storeShift: null, nextShift: null, loading: false, error: err && err.message ? err.message : String(err) });
       }
     })();
     return () => {
@@ -1522,10 +1717,16 @@ var PROMOTER_MODULES = [
   { id: "feedback", label: "Feedback & Insights", hint: "Non-purchase reasons & lost revenue" },
   { id: "custom", label: "Client-specific Questions", hint: "Daily client questions configured per promotion" }
 ];
+// Modules the promoter app hides unless a manager explicitly switches them on.
+// The student app is deliberately just the two counters plus the daily report;
+// these extras stay available per promotion rather than being deleted.
+var PROMOTER_MODULES_OFF_BY_DEFAULT = ["checklist", "feedback", "travel"];
 function isPromoterModuleEnabled(enabledModules, id) {
-  if (!enabledModules || typeof enabledModules !== "object") return true;
+  const defaultOn = !PROMOTER_MODULES_OFF_BY_DEFAULT.includes(id);
+  if (!enabledModules || typeof enabledModules !== "object") return defaultOn;
   if (enabledModules[id] === false) return false;
-  return true;
+  if (enabledModules[id] === true) return true;
+  return defaultOn;
 }
 var PROMOTION = {
   id: "P-2026-05",
@@ -1927,6 +2128,127 @@ function parseProductsCSV(csv) {
   }
   return out;
 }
+// Jobs export from the main system -> stores + their scheduled shifts.
+//
+// The file is shaped as blocks: a row carrying a JID opens a job (= one store),
+// and the rows after it that carry a Shift ID are that store's shifts.
+//
+// This cannot reuse parseProductsCSV: that one splits on newlines before it
+// looks at quotes, and the jobs export has multi-line quoted Job Description
+// cells that would shred every row. So scan character by character and only
+// treat a newline as a row break when we're not inside quotes.
+function parseCSVRows(csv) {
+  const rows = [];
+  let row = [];
+  let cur = "";
+  let inQ = false;
+  const text = String(csv || "");
+  const pushCell = () => {
+    row.push(cur);
+    cur = "";
+  };
+  const pushRow = () => {
+    pushCell();
+    if (row.some((c) => c.trim().length > 0)) rows.push(row);
+    row = [];
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQ) {
+      if (ch === '"' && text[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else if (ch === '"') {
+        inQ = false;
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQ = true;
+    } else if (ch === ",") {
+      pushCell();
+    } else if (ch === "\n") {
+      pushRow();
+    } else if (ch !== "\r") {
+      cur += ch;
+    }
+  }
+  if (cur.length > 0 || row.length > 0) pushRow();
+  return rows;
+}
+// "03.07.2026" -> "2026-07-03". Returns null for anything we can't read, so
+// callers can report the row as skipped instead of writing a bad date.
+function parseGermanDate(raw) {
+  const m = /^\s*(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})\s*$/.exec(String(raw || ""));
+  if (!m) return null;
+  const [, d, mo, y] = m;
+  return `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+}
+function parseClockTime(raw) {
+  const m = /^\s*(\d{1,2}):(\d{2})/.exec(String(raw || ""));
+  if (!m) return null;
+  return `${m[1].padStart(2, "0")}:${m[2]}`;
+}
+function parseJobsCSV(csv) {
+  const rows = parseCSVRows(csv);
+  if (rows.length === 0) return { stores: [], skipped: [], shiftCount: 0 };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const idx = (name) => headers.findIndex((h) => h === name.toLowerCase());
+  const iJid = idx("jid");
+  const iTitle = idx("job title");
+  const iStatus = idx("status");
+  const iShiftId = idx("shift id");
+  const iDate = idx("shift date");
+  const iStart = idx("shift start time");
+  const iEnd = idx("shift end time");
+  const iSlots = idx("shift slots number");
+  if (iTitle < 0 || iDate < 0) {
+    throw new Error('Unexpected CSV format — expected the jobs export with "Job Title" and "Shift Date" columns.');
+  }
+  const stores = [];
+  const skipped = [];
+  let current = null;
+  let shiftCount = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const cells = rows[r];
+    const at = (i) => i >= 0 && cells[i] != null ? String(cells[i]).trim() : "";
+    const jid = at(iJid);
+    if (jid) {
+      const name = at(iTitle);
+      const status = at(iStatus).toLowerCase();
+      if (status === "cancelled" || status === "canceled") {
+        skipped.push({ name, reason: "cancelled" });
+        current = null;
+        continue;
+      }
+      // Same store can appear twice in one export; merge into the first block.
+      const existing = stores.find((s) => s.name === name);
+      if (existing) {
+        current = existing;
+      } else {
+        current = { name, shifts: [] };
+        stores.push(current);
+      }
+      continue;
+    }
+    if (!at(iShiftId)) continue;
+    if (!current) continue;
+    const date = parseGermanDate(at(iDate));
+    if (!date) {
+      skipped.push({ name: at(iDate) || "(no date)", reason: "unreadable date" });
+      continue;
+    }
+    const slotsRaw = Number(at(iSlots));
+    current.shifts.push({
+      date,
+      start: parseClockTime(at(iStart)),
+      end: parseClockTime(at(iEnd)),
+      slots: isFinite(slotsRaw) && slotsRaw > 0 ? slotsRaw : 1
+    });
+    shiftCount++;
+  }
+  return { stores, skipped, shiftCount };
+}
 var promotionProductsStore = {
   // Chanel × Heinemann pilot at Berlin BER — five SKUs
   "P-2026-05": ["3145891255508", "3145891166507", "3145891074208", "3145891415308", "3145891298307"]
@@ -2047,6 +2369,18 @@ function useResolvedPromoterPromotionId(email) {
   return id;
 }
 var fmtEUR = (n) => "\u20AC" + Math.round(n).toLocaleString("en-US");
+// Shared short-day formatter for scheduled shifts, e.g. "Mon 03 Jul".
+// (ManagerPromoters has its own narrower fmtShiftDate scoped to that component.)
+function fmtShiftDay(d) {
+  if (!d) return "\u2014";
+  try {
+    const dt = new Date(String(d).length <= 10 ? d + "T00:00:00" : d);
+    if (isNaN(dt.getTime())) return String(d);
+    return dt.toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "short" });
+  } catch {
+    return String(d);
+  }
+}
 var CHART_COLORS = ["#1e40af", "#0891b2", "#c026d3", "#ea580c", "#65a30d"];
 var totalRevenue = DAILY_REVENUE.reduce((a, b) => a + b.revenue, 0);
 var totalUnits = DAILY_REVENUE.reduce((a, b) => a + b.units, 0);
@@ -2400,7 +2734,7 @@ function buildClientReportHTML() {
 function Modal({ open, onClose, title, children, footer, size = "md" }) {
   if (!open) return null;
   const widthClass = size === "lg" ? "max-w-2xl" : size === "sm" ? "max-w-sm" : "max-w-lg";
-  return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 z-50 bg-black/50 flex items-center justify-center px-4", onClick: onClose }, /* @__PURE__ */ React.createElement("div", { className: `bg-white w-full ${widthClass} rounded-2xl shadow-2xl`, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "px-5 py-3 border-b border-slate-100 flex items-center justify-between" }, /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold" }, title), /* @__PURE__ */ React.createElement("button", { onClick: onClose, className: "text-slate-400 hover:text-slate-700" }, /* @__PURE__ */ React.createElement(X, { className: "w-4 h-4" }))), /* @__PURE__ */ React.createElement("div", { className: "p-5" }, children), footer && /* @__PURE__ */ React.createElement("div", { className: "px-5 py-3 border-t border-slate-100 flex justify-end gap-2" }, footer)));
+  return /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 z-[60] bg-black/50 flex items-center justify-center px-4", onClick: onClose }, /* @__PURE__ */ React.createElement("div", { className: `bg-white w-full ${widthClass} rounded-2xl shadow-2xl max-h-[90vh] flex flex-col`, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { className: "px-5 py-3 border-b border-slate-100 flex items-center justify-between flex-shrink-0" }, /* @__PURE__ */ React.createElement("h3", { className: "text-sm font-semibold" }, title), /* @__PURE__ */ React.createElement("button", { onClick: onClose, className: "text-slate-400 hover:text-slate-700" }, /* @__PURE__ */ React.createElement(X, { className: "w-4 h-4" }))), /* @__PURE__ */ React.createElement("div", { className: "p-5 overflow-y-auto min-h-0" }, children), footer && /* @__PURE__ */ React.createElement("div", { className: "px-5 py-3 border-t border-slate-100 flex justify-end gap-2 flex-shrink-0" }, footer)));
 }
 function ProductResultCard({ p, tone = "emerald", action }) {
   if (!p) return null;
@@ -3012,6 +3346,9 @@ function PromoterApp({ onExit, userEmail }) {
     isLive ? { photo: false, stockConfirmed: false, briefingRead: false, noticedOOS: "" } : { photo: true, stockConfirmed: true, briefingRead: true, noticedOOS: "Chanel No.5 EDP 100ml tester \u2014 only 1 left" }
   );
   const [samples, setSamples] = useState(isLive ? { discoveryMini: 0, bodyLotion: 0 } : { discoveryMini: 14, bodyLotion: 3 });
+  // The two tap counters that replaced per-customer logging. Kept as plain
+  // running totals on the shift row so a student only ever taps + / -.
+  const [counters, setCounters] = useState(isLive ? { approached: 0, raffle: 0 } : { approached: 63, raffle: 21 });
   const [contacts, setContacts] = useState(() => {
     if (isLive) return { entries: [], total: 0, female: 0, male: 0, mixed: 0, ageMain: "" };
     const demoEntries = [
@@ -3102,6 +3439,10 @@ function PromoterApp({ onExit, userEmail }) {
         }
         if (Object.keys(ca).length > 0) setCustomAnswers((prev) => ({ ...prev, ...ca }));
         if (shift) {
+          setCounters({
+            approached: Number(shift.contacts_total) || 0,
+            raffle: Number(shift.raffle_entries) || 0
+          });
           setChecklist((prev) => ({
             ...prev,
             briefingRead: !!shift.briefing_read || prev.briefingRead,
@@ -3158,10 +3499,20 @@ function PromoterApp({ onExit, userEmail }) {
     }, 1e3);
     return () => clearTimeout(t);
   }, [isLive, liveShift.shiftId, checklist]);
+  // Counters save themselves as they're tapped — a student shouldn't have to
+  // remember to press save, and the numbers must survive closing the app.
   useEffect(() => {
     if (!isLive || !liveShift.shiftId) return;
     if (!hydratedRef.current) return;
-    const shiftQs = (customQuestions || []).filter((q) => q && q.id && (q.section || "contact") === "shift");
+    const t = setTimeout(() => {
+      SupabaseAPI.saveCounters(liveShift.shiftId, counters).catch((err) => console.warn("counter auto-save failed:", err && err.message ? err.message : err));
+    }, 800);
+    return () => clearTimeout(t);
+  }, [isLive, liveShift.shiftId, counters]);
+  useEffect(() => {
+    if (!isLive || !liveShift.shiftId) return;
+    if (!hydratedRef.current) return;
+    const shiftQs = (customQuestions || []).filter((q) => q && q.id);
     if (shiftQs.length === 0) return;
     const t = setTimeout(() => {
       SupabaseAPI.saveShiftAnswers(liveShift.shiftId, shiftQs, customAnswers).catch((err) => console.warn("shift answers auto-save failed:", err && err.message ? err.message : err));
@@ -3216,11 +3567,12 @@ function PromoterApp({ onExit, userEmail }) {
     return acc + (price || 0) * s.qty;
   }, 0);
   const shiftUnits = sales.reduce((a, b) => a + b.qty, 0);
-  return /* @__PURE__ */ React.createElement("div", { className: "min-h-screen bg-slate-100 flex flex-col items-center py-6 px-4" }, /* @__PURE__ */ React.createElement("div", { className: "w-full max-w-5xl mb-4 flex items-center justify-between" }, /* @__PURE__ */ React.createElement("button", { onClick: onExit, className: "inline-flex items-center text-sm text-slate-600 hover:text-slate-900" }, /* @__PURE__ */ React.createElement(ChevronLeft, { className: "w-4 h-4 mr-1" }), " Back to role picker"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, "Promoter view \xB7 phone-sized frame")), /* @__PURE__ */ React.createElement("div", { className: "w-full max-w-sm bg-white rounded-3xl border-8 border-slate-900 shadow-xl overflow-hidden", style: { minHeight: "720px" } }, /* @__PURE__ */ React.createElement("div", { className: "bg-slate-900 text-white text-xs px-5 py-1.5 flex items-center justify-between" }, /* @__PURE__ */ React.createElement("span", null, "09:12"), /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "5G  \u2022\u2022\u2022")), isLive && (liveShift.error === "not_a_promoter" || liveShift.error === "not_assigned") ? /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { className: "min-h-screen bg-slate-100 flex flex-col items-center py-6 px-4" }, /* @__PURE__ */ React.createElement("div", { className: "w-full max-w-5xl mb-4 flex items-center justify-between" }, /* @__PURE__ */ React.createElement("button", { onClick: onExit, className: "inline-flex items-center text-sm text-slate-600 hover:text-slate-900" }, /* @__PURE__ */ React.createElement(ChevronLeft, { className: "w-4 h-4 mr-1" }), " Back to role picker"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, "Promoter view \xB7 phone-sized frame")), /* @__PURE__ */ React.createElement("div", { className: "w-full max-w-sm bg-white rounded-3xl border-8 border-slate-900 shadow-xl overflow-hidden", style: { minHeight: "720px" } }, /* @__PURE__ */ React.createElement("div", { className: "bg-slate-900 text-white text-xs px-5 py-1.5 flex items-center justify-between" }, /* @__PURE__ */ React.createElement("span", null, "09:12"), /* @__PURE__ */ React.createElement("span", { className: "font-mono" }, "5G  \u2022\u2022\u2022")), isLive && (liveShift.error === "not_a_promoter" || liveShift.error === "not_assigned" || liveShift.error === "no_shift_today") ? /* @__PURE__ */ React.createElement(
     PromoterEmptyState,
     {
       kind: liveShift.error,
       email: userEmail,
+      nextShift: liveShift.nextShift,
       onExit
     }
   ) : /* @__PURE__ */ React.createElement(React.Fragment, null, screen === "student-home" && /* @__PURE__ */ React.createElement(
@@ -3231,6 +3583,7 @@ function PromoterApp({ onExit, userEmail }) {
       hero: liveHero,
       shiftLoading: liveShift.loading,
       shiftError: liveShift.error,
+      storeShift: liveShift.storeShift,
       promoterId: liveShift.promoterId,
       promotionId: liveShift.promotionId || liveHero && liveHero.id || null
     }
@@ -3243,6 +3596,8 @@ function PromoterApp({ onExit, userEmail }) {
       setSales,
       contacts,
       setContacts,
+      counters,
+      setCounters,
       feedback,
       setFeedback,
       customAnswers,
@@ -3267,8 +3622,30 @@ function PromoterApp({ onExit, userEmail }) {
     }
   ))), /* @__PURE__ */ React.createElement("div", { className: "mt-6 text-xs text-slate-500 max-w-sm text-center" }, "Tap ", /* @__PURE__ */ React.createElement("span", { className: "font-medium text-slate-700" }, "Open Promotion Tracker"), " on the Student App home to enter the new MVP flow. The Student App handles shifts; the Promotion Tracker captures sales & insights."));
 }
-function PromoterEmptyState({ kind, email, onExit }) {
+function PromoterEmptyState({ kind, email, nextShift = null, onExit }) {
   const isNotPromoter = kind === "not_a_promoter";
+  const isNoShift = kind === "no_shift_today";
+  const fmtDay = (iso) => {
+    if (!iso) return null;
+    try {
+      const dt = new Date(`${iso}T00:00:00`);
+      if (isNaN(dt.getTime())) return iso;
+      return dt.toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "short" });
+    } catch {
+      return iso;
+    }
+  };
+  if (isNoShift) {
+    return /* @__PURE__ */ React.createElement("div", { className: "px-6 py-12 text-center" }, /* @__PURE__ */ React.createElement("div", { className: "mx-auto w-14 h-14 rounded-full bg-amber-50 text-amber-600 flex items-center justify-center mb-4" }, /* @__PURE__ */ React.createElement(Clock, { className: "w-7 h-7" })), /* @__PURE__ */ React.createElement("div", { className: "text-base font-semibold text-slate-900" }, "No shift scheduled for today"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-sm text-slate-600" }, "Reporting opens on the days you're scheduled to work. Nothing to log today."), nextShift ? /* @__PURE__ */ React.createElement("div", { className: "mt-5 mx-auto max-w-xs bg-white border border-slate-200 rounded-xl px-4 py-3 text-left" }, /* @__PURE__ */ React.createElement("div", { className: "text-[10px] font-semibold uppercase tracking-wide text-slate-500" }, "Your next shift"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 text-sm font-semibold text-slate-900" }, fmtDay(nextShift.shiftDate)), nextShift.storeName && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mt-0.5 flex items-center gap-1" }, /* @__PURE__ */ React.createElement(MapPin, { className: "w-3 h-3" }), " ", nextShift.storeName), (nextShift.startTime || nextShift.endTime) && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mt-0.5 flex items-center gap-1" }, /* @__PURE__ */ React.createElement(Clock, { className: "w-3 h-3" }), " ", [nextShift.startTime, nextShift.endTime].filter(Boolean).join(" \u2013 "))) : /* @__PURE__ */ React.createElement("div", { className: "mt-6 text-xs text-slate-500" }, "You have no upcoming shifts on this promotion. Ask your manager if that looks wrong."), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: onExit,
+        className: "mt-6 inline-flex items-center gap-1 text-xs text-slate-500 hover:text-slate-900"
+      },
+      /* @__PURE__ */ React.createElement(ChevronLeft, { className: "w-3.5 h-3.5" }),
+      " Back to role picker"
+    ));
+  }
   return /* @__PURE__ */ React.createElement("div", { className: "px-6 py-12 text-center" }, /* @__PURE__ */ React.createElement("div", { className: "mx-auto w-14 h-14 rounded-full bg-slate-100 flex items-center justify-center mb-4" }, /* @__PURE__ */ React.createElement(Users, { className: "w-7 h-7 text-slate-500" })), /* @__PURE__ */ React.createElement("div", { className: "text-base font-semibold text-slate-900" }, isNotPromoter ? "You're not set up as a promoter yet" : "You're not assigned to a promotion"), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-sm text-slate-600" }, isNotPromoter ? "We don't have a promoter record for " : "Your account exists but no manager has added you to a campaign. ", isNotPromoter && /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, email), isNotPromoter && ". Ask your manager to add you in Configuration \u2192 Promoters.", !isNotPromoter && "Ask your manager to assign you in the Configuration tab."), /* @__PURE__ */ React.createElement("div", { className: "mt-6 text-xs text-slate-500" }, "Once you're added, this screen will show your active shift and the contact tracker."), /* @__PURE__ */ React.createElement(
     "button",
     {
@@ -3279,7 +3656,7 @@ function PromoterEmptyState({ kind, email, onExit }) {
     " Back to role picker"
   ));
 }
-function StudentHome({ onOpenTracker, displayName = "there", hero = null, shiftLoading = false, shiftError = null, promoterId = null, promotionId = null }) {
+function StudentHome({ onOpenTracker, displayName = "there", hero = null, shiftLoading = false, shiftError = null, storeShift = null, promoterId = null, promotionId = null }) {
   const isLive = DATA_SOURCE === "supabase";
   const PROMOTER_ID = isLive ? promoterId || null : "U-201";
   const messages = usePromoterMessages(PROMOTER_ID);
@@ -3326,7 +3703,7 @@ function StudentHome({ onOpenTracker, displayName = "there", hero = null, shiftL
     setOpenMessageId(null);
   }, className: "text-slate-400 hover:text-slate-700" }, /* @__PURE__ */ React.createElement(X, { className: "w-4 h-4" }))), !openMessageId && /* @__PURE__ */ React.createElement("div", { className: "overflow-auto" }, messages.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "p-8 text-center text-sm text-slate-500" }, /* @__PURE__ */ React.createElement(MessageSquare, { className: "w-8 h-8 mx-auto mb-2 text-slate-300" }), "No messages yet. When your manager messages you from the dashboard, it appears here.") : /* @__PURE__ */ React.createElement("ul", { className: "divide-y divide-slate-100" }, messages.map((m) => /* @__PURE__ */ React.createElement("li", { key: m.id }, /* @__PURE__ */ React.createElement("button", { onClick: () => openMessage(m.id), className: `w-full text-left px-4 py-3 hover:bg-slate-50 ${!m.read ? "bg-blue-50/40" : ""}` }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-1" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-900 flex items-center gap-1.5" }, !m.read && /* @__PURE__ */ React.createElement("span", { className: "w-2 h-2 rounded-full bg-blue-600 inline-block" }), m.from), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, m.time)), /* @__PURE__ */ React.createElement("div", { className: "text-sm text-slate-700 line-clamp-2" }, m.text), m.replies.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 mt-1" }, m.replies.length, " repl", m.replies.length === 1 ? "y" : "ies")))))), openMessageId && activeMessage && /* @__PURE__ */ React.createElement("div", { className: "flex flex-col flex-1 min-h-0" }, /* @__PURE__ */ React.createElement("div", { className: "px-4 py-3 flex-1 overflow-auto space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "bg-slate-100 rounded-2xl rounded-tl-md px-3 py-2 max-w-xs" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 mb-0.5" }, activeMessage.from, " \xB7 ", activeMessage.time), /* @__PURE__ */ React.createElement("div", { className: "text-sm text-slate-800" }, activeMessage.text)), activeMessage.replies.map((r) => /* @__PURE__ */ React.createElement("div", { key: r.id, className: "bg-blue-600 text-white rounded-2xl rounded-tr-md px-3 py-2 max-w-xs ml-auto" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-blue-100 mb-0.5" }, "You \xB7 ", r.time), /* @__PURE__ */ React.createElement("div", { className: "text-sm" }, r.text)))), /* @__PURE__ */ React.createElement("div", { className: "px-3 py-2 border-t border-slate-100" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-2 flex-wrap" }, ["Got it \u{1F44D}", "On it", "Stock is low, can you check?"].map((t) => /* @__PURE__ */ React.createElement("button", { key: t, onClick: () => setReplyText(t), className: "text-xs px-2 py-1 rounded-full border border-slate-200 hover:bg-slate-50" }, t))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("input", { value: replyText, onChange: (e) => setReplyText(e.target.value), onKeyDown: (e) => {
     if (e.key === "Enter") sendReply();
-  }, placeholder: "Type a reply\u2026", className: "flex-1 border border-slate-300 rounded-full px-3 py-1.5 text-sm" }), /* @__PURE__ */ React.createElement("button", { onClick: sendReply, disabled: !replyText.trim(), className: "w-9 h-9 rounded-full bg-slate-900 text-white flex items-center justify-center disabled:bg-slate-300" }, /* @__PURE__ */ React.createElement(Send, { className: "w-4 h-4" }))))))), /* @__PURE__ */ React.createElement("div", { className: "px-5 pt-5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, today), /* @__PURE__ */ React.createElement("h2", { className: "text-xl font-semibold mt-1" }, "Hi ", displayName, " \u{1F44B}"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-600 mt-1" }, isLive ? shiftLoading ? "Setting up your shift\u2026" : brand ? "You're checked in for your shift today." : "No active promotion selected yet \u2014 ask your manager to assign one." : "You're checked in for one shift today."), isLive && shiftError && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-2 py-1" }, "Shift sync error: ", shiftError)), /* @__PURE__ */ React.createElement("div", { className: "px-5 mt-5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2" }, "Today's shift"), !isLive || brand && client ? /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-br from-blue-50 to-white border border-blue-200 rounded-2xl p-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement(Pill, { tone: "blue" }, "Promotion"), /* @__PURE__ */ React.createElement("h3", { className: "mt-2 font-semibold text-slate-900 leading-snug" }, brand, campaign ? ` \u2014 ${campaign}` : ""), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mt-1" }, client)), !isLive && /* @__PURE__ */ React.createElement("div", { className: "text-right" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, "Shift"), /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "09:00 \u2013 17:00"))), /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-1.5 text-xs text-slate-600" }, (airport || location) && /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(MapPin, { className: "w-3.5 h-3.5" }), " ", [airport, location].filter(Boolean).join(", ")), !isLive && /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Clock, { className: "w-3.5 h-3.5" }), " Checked in 09:02 \xB7 Break not started")), !isLive && /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(Pill, { tone: "green" }, /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center" }, /* @__PURE__ */ React.createElement(Check, { className: "w-3 h-3 mr-1" }), " Checked in")), /* @__PURE__ */ React.createElement(Pill, { tone: "slate" }, "Shift #S-7184"))) : /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 border border-slate-200 rounded-2xl p-4 text-sm text-slate-600" }, "No shift yet. Once your manager assigns you to a promotion and you check in, it will appear here.")), isLive && hero && hero.briefingNotes ? /* @__PURE__ */ React.createElement("div", { className: "px-5 mt-4" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2" }, "Campaign briefing"), /* @__PURE__ */ React.createElement("div", { className: "bg-amber-50 border border-amber-200 rounded-2xl p-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 text-xs font-medium text-amber-800 mb-1.5" }, /* @__PURE__ */ React.createElement(FileText, { className: "w-3.5 h-3.5" }), " From your manager"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-700 whitespace-pre-wrap leading-relaxed" }, hero.briefingNotes))) : null, /* @__PURE__ */ React.createElement("div", { className: "px-5 mt-4" }, /* @__PURE__ */ React.createElement(
+  }, placeholder: "Type a reply\u2026", className: "flex-1 border border-slate-300 rounded-full px-3 py-1.5 text-sm" }), /* @__PURE__ */ React.createElement("button", { onClick: sendReply, disabled: !replyText.trim(), className: "w-9 h-9 rounded-full bg-slate-900 text-white flex items-center justify-center disabled:bg-slate-300" }, /* @__PURE__ */ React.createElement(Send, { className: "w-4 h-4" }))))))), /* @__PURE__ */ React.createElement("div", { className: "px-5 pt-5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, today), /* @__PURE__ */ React.createElement("h2", { className: "text-xl font-semibold mt-1" }, "Hi ", displayName, " \u{1F44B}"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-600 mt-1" }, isLive ? shiftLoading ? "Opening your shift\u2026" : storeShift ? `You're scheduled at ${storeShift.storeName || "your store"} today.` : brand ? "No shift scheduled for you today." : "No active promotion selected yet \u2014 ask your manager to assign one." : "You're checked in for one shift today."), isLive && shiftError && shiftError !== "no_shift_today" && /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-2 py-1" }, "Shift sync error: ", shiftError)), /* @__PURE__ */ React.createElement("div", { className: "px-5 mt-5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2" }, "Today's shift"), !isLive || brand && client ? /* @__PURE__ */ React.createElement("div", { className: "bg-gradient-to-br from-blue-50 to-white border border-blue-200 rounded-2xl p-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement(Pill, { tone: "blue" }, "Promotion"), /* @__PURE__ */ React.createElement("h3", { className: "mt-2 font-semibold text-slate-900 leading-snug" }, brand, campaign ? ` \u2014 ${campaign}` : ""), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mt-1" }, client)), !isLive ? /* @__PURE__ */ React.createElement("div", { className: "text-right" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, "Shift"), /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, "09:00 \u2013 17:00")) : storeShift && (storeShift.startTime || storeShift.endTime) ? /* @__PURE__ */ React.createElement("div", { className: "text-right" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, "Shift"), /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold" }, [storeShift.startTime, storeShift.endTime].filter(Boolean).join(" \u2013 "))) : null), /* @__PURE__ */ React.createElement("div", { className: "mt-3 space-y-1.5 text-xs text-slate-600" }, isLive && storeShift && storeShift.storeName ? /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(MapPin, { className: "w-3.5 h-3.5" }), " ", storeShift.storeName) : (airport || location) && /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(MapPin, { className: "w-3.5 h-3.5" }), " ", [airport, location].filter(Boolean).join(", ")), !isLive && /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Clock, { className: "w-3.5 h-3.5" }), " Checked in 09:02 \xB7 Break not started")), !isLive && /* @__PURE__ */ React.createElement("div", { className: "mt-4 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(Pill, { tone: "green" }, /* @__PURE__ */ React.createElement("span", { className: "inline-flex items-center" }, /* @__PURE__ */ React.createElement(Check, { className: "w-3 h-3 mr-1" }), " Checked in")), /* @__PURE__ */ React.createElement(Pill, { tone: "slate" }, "Shift #S-7184"))) : /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 border border-slate-200 rounded-2xl p-4 text-sm text-slate-600" }, "No shift yet. Once your manager schedules a shift for you, it will appear here.")), isLive && hero && hero.briefingNotes ? /* @__PURE__ */ React.createElement("div", { className: "px-5 mt-4" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2" }, "Campaign briefing"), /* @__PURE__ */ React.createElement("div", { className: "bg-amber-50 border border-amber-200 rounded-2xl p-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-1.5 text-xs font-medium text-amber-800 mb-1.5" }, /* @__PURE__ */ React.createElement(FileText, { className: "w-3.5 h-3.5" }), " From your manager"), /* @__PURE__ */ React.createElement("p", { className: "text-sm text-slate-700 whitespace-pre-wrap leading-relaxed" }, hero.briefingNotes))) : null, /* @__PURE__ */ React.createElement("div", { className: "px-5 mt-4" }, /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: onOpenTracker,
@@ -3345,7 +3722,7 @@ function PromotionTracker(props) {
   const tCampaign = isLive ? hero && hero.campaign : PROMOTION.campaign;
   const tClient = isLive ? hero && hero.client : PROMOTION.client;
   const tLocation = isLive ? hero && hero.location : PROMOTION.location;
-  return /* @__PURE__ */ React.createElement("div", { className: "bg-white" }, /* @__PURE__ */ React.createElement("div", { className: "px-5 py-3 bg-slate-900 text-white" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setScreen(sub === "home" ? "student-home" : "tracker-home"), className: "flex items-center gap-1 text-xs text-slate-300 hover:text-white" }, /* @__PURE__ */ React.createElement(ChevronLeft, { className: "w-4 h-4" }), " ", sub === "home" ? "Student App" : "Tracker"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-300" }, "Promotion Tracker")), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-sm font-semibold leading-tight" }, tBrand || "\u2014", tCampaign ? ` \xB7 ${tCampaign}` : ""), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-300 mt-0.5" }, [tClient, tLocation].filter(Boolean).join(" \xB7 ") || "\u2014")), sub === "home" && /* @__PURE__ */ React.createElement(TrackerHome, { ...props }), sub === "checklist" && /* @__PURE__ */ React.createElement(TrackerChecklist, { ...props }), (sub === "contacts" || sub === "sales") && /* @__PURE__ */ React.createElement(TrackerContacts, { ...props }), sub === "travel" && /* @__PURE__ */ React.createElement(TrackerTravel, { ...props }), sub === "feedback" && /* @__PURE__ */ React.createElement(TrackerFeedback, { ...props }), sub === "custom" && /* @__PURE__ */ React.createElement(TrackerCustom, { ...props }), sub === "submit" && /* @__PURE__ */ React.createElement(TrackerSubmit, { ...props }));
+  return /* @__PURE__ */ React.createElement("div", { className: "bg-white" }, /* @__PURE__ */ React.createElement("div", { className: "px-5 py-3 bg-slate-900 text-white" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setScreen(sub === "home" ? "student-home" : "tracker-home"), className: "flex items-center gap-1 text-xs text-slate-300 hover:text-white" }, /* @__PURE__ */ React.createElement(ChevronLeft, { className: "w-4 h-4" }), " ", sub === "home" ? "Student App" : "Tracker"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-300" }, "Promotion Tracker")), /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-sm font-semibold leading-tight" }, tBrand || "\u2014", tCampaign ? ` \xB7 ${tCampaign}` : ""), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-300 mt-0.5" }, [tClient, tLocation].filter(Boolean).join(" \xB7 ") || "\u2014")), sub === "home" && /* @__PURE__ */ React.createElement(TrackerHome, { ...props }), sub === "checklist" && /* @__PURE__ */ React.createElement(TrackerChecklist, { ...props }), (sub === "contacts" || sub === "sales") && /* @__PURE__ */ React.createElement(TrackerCounters, { ...props }), sub === "travel" && /* @__PURE__ */ React.createElement(TrackerTravel, { ...props }), sub === "feedback" && /* @__PURE__ */ React.createElement(TrackerFeedback, { ...props }), sub === "custom" && /* @__PURE__ */ React.createElement(TrackerCustom, { ...props }), sub === "submit" && /* @__PURE__ */ React.createElement(TrackerSubmit, { ...props }));
 }
 function TrackerChecklist({ checklist, setChecklist, setScreen }) {
   const toggle = (k) => setChecklist({ ...checklist, [k]: !checklist[k] });
@@ -3389,37 +3766,76 @@ function TrackerTravel({ samples, setSamples }) {
 function SampleRow({ label, value, onChange }) {
   return /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between border border-slate-200 rounded-lg px-3 py-2" }, /* @__PURE__ */ React.createElement("span", { className: "text-sm" }, label), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: () => onChange(Math.max(0, value - 1)), className: "w-7 h-7 rounded-full border border-slate-300 flex items-center justify-center" }, /* @__PURE__ */ React.createElement(Minus, { className: "w-3.5 h-3.5" })), /* @__PURE__ */ React.createElement("span", { className: "text-sm font-semibold w-6 text-center" }, value), /* @__PURE__ */ React.createElement("button", { onClick: () => onChange(value + 1), className: "w-7 h-7 rounded-full border border-slate-300 flex items-center justify-center" }, /* @__PURE__ */ React.createElement(Plus, { className: "w-3.5 h-3.5" }))));
 }
-function TrackerHome({ setScreen, shiftRevenue, shiftUnits, contacts, submitted, checklist, samples, customQuestions, enabledModules = null, promoterConfig = DEFAULT_PROMOTER_CONFIG }) {
+// Big tap targets, nothing else. This replaced a form with gender, age group,
+// customer type, a purchase checkbox and an article picker — the whole point is
+// that a student can log without really looking at their phone.
+function CounterBlock({ label, hint, value, onChange, tone = "blue", disabled = false }) {
+  const toneMap = {
+    blue: "bg-blue-600 hover:bg-blue-700",
+    emerald: "bg-emerald-600 hover:bg-emerald-700"
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "border border-slate-200 rounded-2xl p-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-baseline justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold text-slate-900" }, label), /* @__PURE__ */ React.createElement("div", { className: "text-3xl font-bold tabular-nums text-slate-900" }, value)), hint && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 mt-0.5" }, hint), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex items-center gap-3" }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => onChange(Math.max(0, value - 1)),
+      disabled: disabled || value <= 0,
+      "aria-label": `${label} minus one`,
+      className: "w-14 h-14 rounded-2xl border-2 border-slate-300 text-slate-600 flex items-center justify-center disabled:opacity-40 active:scale-95 transition-transform"
+    },
+    /* @__PURE__ */ React.createElement(Minus, { className: "w-6 h-6" })
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => onChange(value + 1),
+      disabled,
+      "aria-label": `${label} plus one`,
+      className: `flex-1 h-14 rounded-2xl text-white flex items-center justify-center font-semibold disabled:opacity-40 active:scale-95 transition-transform ${toneMap[tone]}`
+    },
+    /* @__PURE__ */ React.createElement(Plus, { className: "w-6 h-6" })
+  )));
+}
+function TrackerCounters({ counters, setCounters, shiftId, shiftLoading }) {
+  const isLive = DATA_SOURCE === "supabase";
+  const blocked = isLive && !shiftId;
+  const set = (key) => (v) => {
+    if (blocked) {
+      addToast(shiftLoading ? "Still opening your shift — one moment" : "No shift scheduled today — nothing to log", "amber");
+      return;
+    }
+    setCounters((c) => ({ ...c, [key]: v }));
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "px-5 py-5 space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: "font-semibold" }, "Zähler"), /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mt-1" }, "Tippe mit — die Zahlen speichern sich automatisch.")), blocked && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" }, shiftLoading ? "Opening your shift…" : "No shift scheduled for today, so nothing can be logged."), /* @__PURE__ */ React.createElement(CounterBlock, {
+    label: "Angesprochen",
+    hint: "Personen, die du angesprochen hast",
+    value: counters.approached || 0,
+    onChange: set("approached"),
+    tone: "blue",
+    disabled: blocked
+  }), /* @__PURE__ */ React.createElement(CounterBlock, {
+    label: "Gewinnspiel",
+    hint: "Teilnahmen am Gewinnspiel",
+    value: counters.raffle || 0,
+    onChange: set("raffle"),
+    tone: "emerald",
+    disabled: blocked
+  }));
+}
+function TrackerHome({ setScreen, shiftRevenue, shiftUnits, contacts, counters = { approached: 0, raffle: 0 }, submitted, checklist, samples, customQuestions, enabledModules = null, promoterConfig = DEFAULT_PROMOTER_CONFIG }) {
   const checklistDone = checklist.photo && checklist.stockConfirmed && checklist.briefingRead;
   const totalSamples = (samples.discoveryMini || 0) + (samples.bodyLotion || 0);
   const qCount = (customQuestions || []).length;
-  const hintPieces = [`${contacts.total} contacts`];
-  if (promoterConfig.product_mode !== "free") hintPieces.push(`${shiftUnits} units`);
-  if (promoterConfig.show_revenue_kpi) hintPieces.push(fmtEUR(shiftRevenue));
-  const contactsHintBase = hintPieces.join(" \xB7 ");
-  const contactsHint = qCount > 0 ? `${contactsHintBase} \xB7 ${qCount} client Q${qCount === 1 ? "" : "s"} per contact` : contactsHintBase;
   const allItems = [
     { id: "checklist", label: "Shift-start checklist", icon: ClipboardCheck, hint: checklistDone ? "Done \xB7 booth photo + stock OK" : "Open before serving first customer", tone: checklistDone ? "green" : "rose" },
-    { id: "contacts", label: "Customer Contacts & Sales", icon: Users, hint: contactsHint, tone: "blue" },
+    { id: "contacts", label: "Z\xE4hler", icon: Users, hint: `${counters.approached || 0} angesprochen \xB7 ${counters.raffle || 0} Gewinnspiel`, tone: "blue" },
     // Samples dispensed — hidden for now (all roles). To re-enable, uncomment:
     // { id: "travel", label: "Samples dispensed", icon: Plane, hint: `${totalSamples} samples logged`, tone: "purple" },
     { id: "feedback", label: "Feedback & Insights", icon: MessageSquare, hint: "Non-purchase reasons \xB7 Lost revenue", tone: "amber" }
   ];
   const items = allItems.filter((it) => it.id === "contacts" || isPromoterModuleEnabled(enabledModules, it.id));
-  return /* @__PURE__ */ React.createElement("div", { className: "px-5 py-5 space-y-4" }, (() => {
-    const cards = [];
-    cards.push({ label: "Contacts", value: contacts.total });
-    const purchasedCount = (contacts.entries || []).filter((e) => e.purchased).length;
-    cards.push({ label: (promoterConfig.purchased_label || "Purchased").toUpperCase(), value: purchasedCount });
-    if (promoterConfig.product_mode !== "free") {
-      cards.push({ label: "Units", value: shiftUnits });
-    }
-    if (promoterConfig.show_revenue_kpi) {
-      cards.push({ label: "Revenue", value: fmtEUR(shiftRevenue) });
-    }
-    const cols = cards.length >= 4 ? "grid-cols-4" : cards.length === 3 ? "grid-cols-3" : cards.length === 2 ? "grid-cols-2" : "grid-cols-1";
-    return /* @__PURE__ */ React.createElement("div", { className: `grid ${cols} gap-2` }, cards.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.label, className: "bg-slate-50 rounded-lg p-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 uppercase tracking-wide truncate" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "text-lg font-semibold" }, c.value))));
-  })(), /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500" }, "Log during your shift"), /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, items.map((it) => {
+  return /* @__PURE__ */ React.createElement("div", { className: "px-5 py-5 space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-2" }, [
+    { label: "Angesprochen", value: counters.approached || 0 },
+    { label: "Gewinnspiel", value: counters.raffle || 0 }
+  ].map((c) => /* @__PURE__ */ React.createElement("div", { key: c.label, className: "bg-slate-50 rounded-lg p-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 uppercase tracking-wide truncate" }, c.label), /* @__PURE__ */ React.createElement("div", { className: "text-lg font-semibold" }, c.value)))), /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500" }, "Log during your shift"), /* @__PURE__ */ React.createElement("div", { className: "space-y-2" }, items.map((it) => {
     const Icon = it.icon;
     const toneMap = {
       blue: "bg-blue-50 text-blue-700",
@@ -3446,7 +3862,7 @@ function TrackerHome({ setScreen, shiftRevenue, shiftUnits, contacts, submitted,
       className: `w-full rounded-xl py-3 px-4 flex items-center justify-center gap-2 font-medium ${submitted ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-slate-900 text-white hover:bg-slate-800"}`
     },
     submitted ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Check, { className: "w-4 h-4" }), " Daily report submitted") : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Send, { className: "w-4 h-4" }), " Submit daily report")
-  ), /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-xs text-slate-500 text-center" }, "Submitting marks the day as complete. You can still edit until midnight.")));
+  ), /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-xs text-slate-500 text-center" }, qCount > 0 ? `${qCount} question${qCount === 1 ? "" : "s"} from your client · you can still edit until midnight.` : "Submitting marks the day as complete. You can still edit until midnight.")));
 }
 function TrackerContacts({ contacts, setContacts, sales, setSales, shiftId, shiftLoading, customQuestions = [], enabledModules = null, promoterConfig = DEFAULT_PROMOTER_CONFIG }) {
   const isLive = DATA_SOURCE === "supabase";
@@ -4025,18 +4441,28 @@ function TrackerCustom({ customAnswers, setCustomAnswers, customQuestions }) {
     }
   ));
 }
-function TrackerSubmit({ setScreen, sales, contacts, feedback, samples, customAnswers, customQuestions, checklist, shiftRevenue, shiftUnits, submitted, setSubmitted, clearDrafts = () => {
+function TrackerSubmit({ setScreen, sales, contacts, counters = { approached: 0, raffle: 0 }, feedback, samples, customAnswers, setCustomAnswers = () => {
+}, customQuestions, checklist, shiftRevenue, shiftUnits, submitted, setSubmitted, clearDrafts = () => {
 }, shiftId }) {
   const [submitting, setSubmitting] = useState(false);
   const handleSubmit = async () => {
-    if (DATA_SOURCE !== "supabase" || !shiftId) {
+    if (DATA_SOURCE !== "supabase") {
       setSubmitted(true);
+      return;
+    }
+    // Live but no report row means there is no scheduled shift behind this
+    // session. Fail loudly — previously this reported a fake success and threw
+    // the promoter's numbers away.
+    if (!shiftId) {
+      addToast("No shift scheduled for today — nothing was submitted", "rose");
       return;
     }
     setSubmitting(true);
     try {
       await SupabaseAPI.saveFeedbackSnapshot(shiftId, feedback || {});
-      const shiftQs = (customQuestions || []).filter((q) => q && q.id && (q.section || "contact") === "shift");
+      // Every question is answered once per shift now that there are no
+      // individual contact records to hang them off.
+      const shiftQs = (customQuestions || []).filter((q) => q && q.id);
       if (shiftQs.length > 0) {
         await SupabaseAPI.saveShiftAnswers(shiftId, shiftQs, customAnswers || {});
       }
@@ -4044,11 +4470,8 @@ function TrackerSubmit({ setScreen, sales, contacts, feedback, samples, customAn
       const shiftPatch = {
         status: "submitted",
         end_time: (/* @__PURE__ */ new Date()).toISOString(),
-        contacts_total: Number(contacts && contacts.total) || 0,
-        contacts_female: Number(contacts && contacts.female) || 0,
-        contacts_male: Number(contacts && contacts.male) || 0,
-        contacts_mixed: Number(contacts && contacts.mixed) || 0,
-        age_main: contacts && contacts.ageMain || null,
+        contacts_total: Math.max(0, Number(counters && counters.approached) || 0),
+        raffle_entries: Math.max(0, Number(counters && counters.raffle) || 0),
         checklist_complete: checklistDone,
         briefing_read: !!(checklist && checklist.briefingRead)
       };
@@ -4071,7 +4494,57 @@ function TrackerSubmit({ setScreen, sales, contacts, feedback, samples, customAn
       setSubmitting(false);
     }
   };
-  return /* @__PURE__ */ React.createElement("div", { className: "px-5 py-5 space-y-4" }, /* @__PURE__ */ React.createElement("h3", { className: "font-semibold" }, "Submit Daily Report"), /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 rounded-xl p-4 space-y-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Sales"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, shiftUnits, " units \xB7 ", fmtEUR(shiftRevenue))), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Customer contacts"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, contacts.total)), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Main age group"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, contacts.ageMain)), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Non-purchase reasons"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, feedback.reasons.length)), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Estimated lost revenue"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, fmtEUR(feedback.lostRev))), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Custom Qs answered"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, Object.keys(customAnswers).length))), feedback.quote && /* @__PURE__ */ React.createElement("div", { className: "border-l-2 border-amber-400 bg-amber-50 rounded-r-lg px-3 py-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 uppercase tracking-wide font-semibold" }, "Quote to share"), /* @__PURE__ */ React.createElement("div", { className: "text-sm italic text-slate-800 mt-1" }, '"', feedback.quote, '"')), !submitted ? /* @__PURE__ */ React.createElement(
+  const reportQs = (customQuestions || []).filter((q) => q && q.id);
+  const answeredCount = reportQs.filter((q) => {
+    const v = customAnswers && customAnswers[q.id];
+    return v !== void 0 && v !== null && v !== "";
+  }).length;
+  return /* @__PURE__ */ React.createElement("div", { className: "px-5 py-5 space-y-4" }, /* @__PURE__ */ React.createElement("h3", { className: "font-semibold" }, "Daily report"), /* @__PURE__ */ React.createElement("div", { className: "bg-slate-50 rounded-xl p-4 space-y-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Angesprochen"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, counters.approached || 0)), /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Gewinnspiel"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, counters.raffle || 0)), reportQs.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "flex justify-between text-sm" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-600" }, "Questions answered"), /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, answeredCount, " / ", reportQs.length))), reportQs.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500" }, "Questions from your client"), /* @__PURE__ */ React.createElement("span", { className: "text-[10px] text-slate-400" }, "All optional")), reportQs.map((q, idx) => {
+    const shortId = q.id && /^Q\d+$/.test(String(q.id)) ? q.id : `Q${idx + 1}`;
+    const value = customAnswers && customAnswers[q.id] != null ? customAnswers[q.id] : "";
+    const setValue = (v) => setCustomAnswers((prev) => ({ ...prev, [q.id]: v }));
+    const isNumeric = q.type === "count" || q.type === "number" || q.type === "rating_1_5";
+    const isBoolean = q.type === "boolean";
+    const choices = (q.type === "multi_choice" || q.type === "choice") && q.raw && Array.isArray(q.raw.choices) ? q.raw.choices : null;
+    return /* @__PURE__ */ React.createElement("div", { key: q.id }, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700 flex items-start gap-2 mb-1" }, /* @__PURE__ */ React.createElement(Pill, { tone: "rose" }, shortId), /* @__PURE__ */ React.createElement("span", { className: "flex-1" }, q.question)), isBoolean ? /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, ["yes", "no"].map((opt) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: opt,
+        type: "button",
+        onClick: () => setValue(value === opt ? "" : opt),
+        className: `flex-1 border rounded-lg px-3 py-2 text-sm capitalize ${value === opt ? "bg-rose-50 border-rose-300 text-rose-700 font-medium" : "border-slate-300 text-slate-700"}`
+      },
+      opt
+    ))) : choices ? /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        value,
+        onChange: (e) => setValue(e.target.value),
+        className: "w-full border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white"
+      },
+      /* @__PURE__ */ React.createElement("option", { value: "" }, "— skip —"),
+      choices.map((c) => /* @__PURE__ */ React.createElement("option", { key: c, value: c }, c))
+    ) : isNumeric ? /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "number",
+        inputMode: "numeric",
+        value,
+        onChange: (e) => setValue(e.target.value),
+        placeholder: "0",
+        className: "w-full border border-slate-300 rounded-lg px-3 py-2 text-sm"
+      }
+    ) : /* @__PURE__ */ React.createElement(
+      "textarea",
+      {
+        value,
+        rows: 2,
+        onChange: (e) => setValue(e.target.value),
+        placeholder: "Optional",
+        className: "w-full border border-slate-300 rounded-lg px-3 py-2 text-sm"
+      }
+    ));
+  })), feedback && feedback.quote && /* @__PURE__ */ React.createElement("div", { className: "border-l-2 border-amber-400 bg-amber-50 rounded-r-lg px-3 py-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 uppercase tracking-wide font-semibold" }, "Quote to share"), /* @__PURE__ */ React.createElement("div", { className: "text-sm italic text-slate-800 mt-1" }, '"', feedback.quote, '"')), !submitted ? /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: handleSubmit,
@@ -4154,6 +4627,11 @@ function ManagerApp({ onExit, onPreviewClient }) {
     }
   }, [activePromo]);
   const [filtersOpen, setFiltersOpen] = useState(false);
+  const [accessOpen, setAccessOpen] = useState(false);
+  // Accounts are global, so this lives in the top bar rather than under a
+  // promotion. The badge nags about people stuck without a role.
+  const { data: accountsRaw, reload: reloadAccounts } = useProfiles();
+  const pendingAccounts = (accountsRaw || []).filter((p) => p && !p.role).length;
   const [exportOpen, setExportOpen] = useState(false);
   const [briefingOpen, setBriefingOpen] = useState(false);
   const [filters, setFilters] = useState({ range: "campaign", location: "all", promoter: "all", shift: "all" });
@@ -4324,7 +4802,7 @@ function ManagerApp({ onExit, onPreviewClient }) {
     },
     /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium" }, p.brand), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, p.client, " \xB7 ", p.note)),
     activePromo === p.id && /* @__PURE__ */ React.createElement(Check, { className: "w-4 h-4 text-blue-600" })
-  ))), projectList.length > visibleProjectList.length && /* @__PURE__ */ React.createElement("li", { className: "px-3 py-2 text-[11px] text-slate-400 text-center border-t border-slate-100" }, projectList.length - visibleProjectList.length, " archived promotion", projectList.length - visibleProjectList.length === 1 ? "" : "s", " hidden")))))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3 text-sm" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setFiltersOpen(true), className: "inline-flex items-center gap-1.5 text-slate-600 hover:text-slate-900" }, /* @__PURE__ */ React.createElement(Filter, { className: "w-4 h-4" }), " Filters"), /* @__PURE__ */ React.createElement("div", { className: "relative" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setExportOpen(!exportOpen), className: "inline-flex items-center gap-1.5 text-slate-600 hover:text-slate-900" }, /* @__PURE__ */ React.createElement(Download, { className: "w-4 h-4" }), " Export"), exportOpen && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 z-30", onClick: () => setExportOpen(false) }), /* @__PURE__ */ React.createElement("div", { className: "absolute right-0 top-8 w-64 bg-white border border-slate-200 rounded-xl shadow-xl z-40" }, DATA_SOURCE === "supabase" ? /* @__PURE__ */ React.createElement("div", { className: "p-4 text-sm text-slate-600" }, /* @__PURE__ */ React.createElement("div", { className: "font-medium text-slate-900 mb-1" }, "Live exports coming soon"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, "CSV / PDF exports from live Supabase data are not yet enabled. Use the Reports tab to generate per-promotion reports.")) : [
+  ))), projectList.length > visibleProjectList.length && /* @__PURE__ */ React.createElement("li", { className: "px-3 py-2 text-[11px] text-slate-400 text-center border-t border-slate-100" }, projectList.length - visibleProjectList.length, " archived promotion", projectList.length - visibleProjectList.length === 1 ? "" : "s", " hidden")))))), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3 text-sm" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setAccessOpen(true), className: "inline-flex items-center gap-1.5 text-slate-600 hover:text-slate-900" }, /* @__PURE__ */ React.createElement(Users, { className: "w-4 h-4" }), " Access", pendingAccounts > 0 && /* @__PURE__ */ React.createElement("span", { className: "ml-0.5 min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-white text-[10px] font-bold flex items-center justify-center" }, pendingAccounts)), /* @__PURE__ */ React.createElement("button", { onClick: () => setFiltersOpen(true), className: "inline-flex items-center gap-1.5 text-slate-600 hover:text-slate-900" }, /* @__PURE__ */ React.createElement(Filter, { className: "w-4 h-4" }), " Filters"), /* @__PURE__ */ React.createElement("div", { className: "relative" }, /* @__PURE__ */ React.createElement("button", { onClick: () => setExportOpen(!exportOpen), className: "inline-flex items-center gap-1.5 text-slate-600 hover:text-slate-900" }, /* @__PURE__ */ React.createElement(Download, { className: "w-4 h-4" }), " Export"), exportOpen && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "fixed inset-0 z-30", onClick: () => setExportOpen(false) }), /* @__PURE__ */ React.createElement("div", { className: "absolute right-0 top-8 w-64 bg-white border border-slate-200 rounded-xl shadow-xl z-40" }, DATA_SOURCE === "supabase" ? /* @__PURE__ */ React.createElement("div", { className: "p-4 text-sm text-slate-600" }, /* @__PURE__ */ React.createElement("div", { className: "font-medium text-slate-900 mb-1" }, "Live exports coming soon"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500" }, "CSV / PDF exports from live Supabase data are not yet enabled. Use the Reports tab to generate per-promotion reports.")) : [
     {
       label: "CSV \u2014 raw daily reports",
       tone: "blue",
@@ -4439,6 +4917,16 @@ function ManagerApp({ onExit, onPreviewClient }) {
         if (created && created.id) setActivePromo(created.id);
       }
     }
+  ), /* @__PURE__ */ React.createElement(
+    Modal,
+    {
+      open: accessOpen,
+      onClose: () => setAccessOpen(false),
+      title: "Access \xB7 accounts & roles",
+      size: "lg",
+      footer: /* @__PURE__ */ React.createElement("button", { onClick: () => setAccessOpen(false), className: "px-3 py-1.5 text-sm border border-slate-200 rounded-lg hover:bg-slate-50" }, "Done")
+    },
+    /* @__PURE__ */ React.createElement(TeamAccessConfig, { onChanged: reloadAccounts })
   ));
 }
 function EditPromotionModal({ open, onClose, promotion, onSaved }) {
@@ -4803,7 +5291,7 @@ function AssignPromoterModal({ open, onClose, promotionId, alreadyAssigned = [],
         className: `px-3 py-1.5 rounded-md font-medium ${mode === "new" ? "bg-white shadow-sm text-slate-900" : "text-slate-600 hover:text-slate-900"}`
       },
       "Create new"
-    )), mode === "pick" && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-500 bg-slate-50 border border-slate-100 rounded-lg px-3 py-2" }, "This adds them to the promotion. Pick which store and days they actually work by assigning them to shifts under ", /* @__PURE__ */ React.createElement("span", { className: "font-medium text-slate-700" }, "Stores & shifts"), "."), mode === "pick" && /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, /* @__PURE__ */ React.createElement(
       "input",
       {
         type: "text",
@@ -4981,6 +5469,58 @@ function ManagerInsights({ metrics }) {
     return /* @__PURE__ */ React.createElement("li", { key: i, className: `border-l-2 pl-3 ${visible ? "border-amber-400" : "border-slate-300"}` }, /* @__PURE__ */ React.createElement("div", { className: "text-sm italic text-slate-800" }, '"', q.quote, '"'), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 mt-0.5 flex items-center gap-2" }, /* @__PURE__ */ React.createElement("span", null, q.who, " \xB7 by ", q.promoter), /* @__PURE__ */ React.createElement("button", { onClick: () => toggleQuote(i), className: "focus:outline-none" }, visible ? /* @__PURE__ */ React.createElement(Pill, { tone: "green" }, "Client-visible") : /* @__PURE__ */ React.createElement(Pill, { tone: "slate" }, "Internal"))));
   }))))));
 }
+// Approve people who have signed up and set what they can do. Anyone who
+// registers lands here with no role, stuck on the "Pending access" screen until
+// a manager picks one.
+function TeamAccessConfig({ onChanged = () => {
+} }) {
+  const auth = useAuth();
+  const { data: profilesRaw, loading, reload } = useProfiles();
+  const [saving, setSaving] = useState(null);
+  const profiles = profilesRaw || [];
+  const myId = auth && auth.session && auth.session.user && auth.session.user.id || null;
+  const myRole = auth && auth.profile && auth.profile.role || null;
+  const isAdmin = myRole === "admin";
+  const setRole = async (p, role) => {
+    setSaving(p.id);
+    try {
+      await SupabaseAPI.setUserRole(p.id, role || null);
+      addToast(role ? `${p.email} is now ${role}` : `${p.email} set to pending`, "green");
+      reload && reload();
+      onChanged();
+    } catch (err) {
+      // The database is the gatekeeper, so surface its refusal verbatim rather
+      // than inventing our own wording for it.
+      addToast(err.message || String(err), "rose");
+    } finally {
+      setSaving(null);
+    }
+  };
+  const pending = profiles.filter((p) => !p.role);
+  const active = profiles.filter((p) => p.role);
+  const roleOptions = isAdmin ? ["admin", "manager", "promoter", "client"] : ["manager", "promoter", "client"];
+  const row = (p) => {
+    const isSelf = p.id === myId;
+    const lockedAdmin = p.role === "admin" && !isAdmin;
+    const disabled = saving === p.id || isSelf || lockedAdmin;
+    return /* @__PURE__ */ React.createElement("li", { key: p.id, className: "flex items-center gap-3 px-3 py-2 border border-slate-200 rounded-lg" }, /* @__PURE__ */ React.createElement("div", { className: "w-8 h-8 rounded-full bg-slate-900 text-white text-xs flex items-center justify-center font-semibold shrink-0" }, (p.full_name || p.email || "?").split(/[\s@]/).map((w) => w[0]).filter(Boolean).slice(0, 2).join("").toUpperCase()), /* @__PURE__ */ React.createElement("div", { className: "flex-1 min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-900 truncate" }, p.full_name || p.email || "(no email)"), p.full_name && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 truncate" }, p.email), isSelf && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400" }, "That's you — ask another admin to change your role"), lockedAdmin && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-slate-400" }, "Only an admin can change an admin"), !p.role && /* @__PURE__ */ React.createElement("div", { className: "text-[10px] text-amber-600" }, "Waiting for a role — can't use the app yet")), /* @__PURE__ */ React.createElement(
+      "select",
+      {
+        value: p.role || "",
+        disabled,
+        onChange: (e) => setRole(p, e.target.value),
+        className: "border border-slate-300 rounded-lg px-2 py-1.5 text-xs bg-white disabled:bg-slate-50 disabled:text-slate-400"
+      },
+      /* @__PURE__ */ React.createElement("option", { value: "" }, "— pending —"),
+      roleOptions.map((r) => /* @__PURE__ */ React.createElement("option", { key: r, value: r }, r.charAt(0).toUpperCase() + r.slice(1))),
+      p.role === "admin" && !isAdmin && /* @__PURE__ */ React.createElement("option", { value: "admin" }, "Admin")
+    ));
+  };
+  if (DATA_SOURCE !== "supabase") {
+    return /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" }, 'Running on demo data — switch DATA_SOURCE to "supabase" to manage accounts.');
+  }
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600" }, "People sign up themselves at the login screen; give them a role here to let them in. ", /* @__PURE__ */ React.createElement("span", { className: "font-medium text-slate-800" }, "Promoter"), " logs shifts, ", /* @__PURE__ */ React.createElement("span", { className: "font-medium text-slate-800" }, "Manager"), " runs promotions, ", /* @__PURE__ */ React.createElement("span", { className: "font-medium text-slate-800" }, "Client"), " sees only their own report.", !isAdmin && " Granting admin is restricted to admins."), loading && profiles.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 italic" }, "Loading accounts…") : /* @__PURE__ */ React.createElement(React.Fragment, null, pending.length > 0 && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-amber-700 mb-2" }, "Waiting for approval (", pending.length, ")"), /* @__PURE__ */ React.createElement("ul", { className: "space-y-2" }, pending.map(row))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold uppercase tracking-wide text-slate-500 mb-2" }, "Team (", active.length, ")"), active.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 italic" }, "No accounts with a role yet.") : /* @__PURE__ */ React.createElement("ul", { className: "space-y-2" }, active.map(row)))));
+}
 function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, onReloadProjects }) {
   const { data: remoteQuestions } = useJobDynamicFields(activePromoId);
   const [questions, setQuestions] = useState(remoteQuestions || CUSTOM_QUESTIONS);
@@ -4988,11 +5528,31 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
     if (remoteQuestions) setQuestions(remoteQuestions);
   }, [activePromoId, remoteQuestions && remoteQuestions.length]);
   const [editing, setEditing] = useState(null);
-  const [draft, setDraft] = useState({ id: "", question: "", type: "text", clientVisible: false, choices: [], section: "contact" });
+  const [draft, setDraft] = useState({ id: "", question: "", type: "text", clientVisible: false, choices: [], section: "shift" });
   const [addOpen, setAddOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [editPromoOpen, setEditPromoOpen] = useState(false);
   const [assignOpen, setAssignOpen] = useState(false);
+  const [newStoreName, setNewStoreName] = useState("");
+  const [expandedStore, setExpandedStore] = useState(null);
+  const [renamingStore, setRenamingStore] = useState(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [shiftDraft, setShiftDraft] = useState({ date: "", start: "", end: "" });
+  const [csvOpen, setCsvOpen] = useState(false);
+  const [csvText, setCsvText] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [csvFileName, setCsvFileName] = useState("");
+  const pickCsvFile = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setCsvText(String(reader.result || ""));
+      setCsvFileName(file.name);
+    };
+    reader.onerror = () => addToast("Could not read that file", "rose");
+    reader.readAsText(file);
+  };
+  const [savingStore, setSavingStore] = useState(false);
   usePromoProductsVersion();
   useCatalogVersion();
   const { data: livePromoProducts, reload: reloadLivePromoProducts } = usePromotionProductsLive(
@@ -5025,12 +5585,40 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
   const { data: candidates } = useCandidates();
   const candidateList = candidates || [];
   const { data: assignments, reload: reloadAssignments } = usePromoterAssignments(DATA_SOURCE === "supabase" ? activePromoId : null);
-  const liveAssigned = (assignments || []).map((a) => a.promoters).filter(Boolean).map((p) => ({
-    id: p.id,
-    name: p.name || (p.email ? p.email.split("@")[0] : "(unnamed)"),
-    email: p.email,
-    initials: (p.name || p.email || "?").split(/[\s@]/).map((w) => w[0]).filter(Boolean).slice(0, 2).join("").toUpperCase()
-  }));
+  const { data: storesRaw, reload: reloadStores } = useStores(DATA_SOURCE === "supabase" ? activePromoId : null);
+  const { data: storeShiftsRaw, reload: reloadStoreShifts } = useStoreShifts(DATA_SOURCE === "supabase" ? activePromoId : null);
+  const storeShifts = storeShiftsRaw || [];
+  const shiftsByStore = useMemo(() => {
+    const m = /* @__PURE__ */ new Map();
+    for (const sh of storeShifts) {
+      if (!m.has(sh.store_id)) m.set(sh.store_id, []);
+      m.get(sh.store_id).push(sh);
+    }
+    return m;
+  }, [storeShifts]);
+  const stores = storesRaw || [];
+  // How many shifts each promoter is on. Store isn't a property of the
+  // promotion-level assignment any more — it comes from the shifts they work.
+  const shiftCountByPromoter = useMemo(() => {
+    const m = /* @__PURE__ */ new Map();
+    for (const sh of storeShifts) {
+      for (const a of sh.shift_assignments || []) {
+        if (!a || !a.promoter_id) continue;
+        m.set(a.promoter_id, (m.get(a.promoter_id) || 0) + 1);
+      }
+    }
+    return m;
+  }, [storeShifts]);
+  const liveAssigned = (assignments || []).filter((a) => a.promoters).map((a) => {
+    const p = a.promoters;
+    return {
+      id: p.id,
+      name: p.name || (p.email ? p.email.split("@")[0] : "(unnamed)"),
+      email: p.email,
+      shiftCount: shiftCountByPromoter.get(p.id) || 0,
+      initials: (p.name || p.email || "?").split(/[\s@]/).map((w) => w[0]).filter(Boolean).slice(0, 2).join("").toUpperCase()
+    };
+  });
   const unassign = async (promoterId, name) => {
     try {
       const sold = await SupabaseAPI.countPromoterSales(activePromoId, promoterId);
@@ -5049,9 +5637,132 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
       addToast(`Remove failed: ${err.message || err}`, "rose");
     }
   };
+  const addStore = async () => {
+    if (!newStoreName.trim() || !activePromoId) return;
+    setSavingStore(true);
+    try {
+      await SupabaseAPI.createStore(activePromoId, newStoreName.trim());
+      setNewStoreName("");
+      addToast("Store added", "green");
+      reloadStores && reloadStores();
+    } catch (err) {
+      addToast(`Add store failed: ${err.message || err}`, "rose");
+    } finally {
+      setSavingStore(false);
+    }
+  };
+  const saveRename = async () => {
+    const target = renamingStore;
+    const next = renameValue.trim();
+    if (!target) return;
+    if (!next || next === target.name) {
+      setRenamingStore(null);
+      return;
+    }
+    try {
+      await SupabaseAPI.renameStore(target.id, next);
+      setRenamingStore(null);
+      addToast("Store renamed", "green");
+      reloadStores && reloadStores();
+      reloadStoreShifts && reloadStoreShifts();
+    } catch (err) {
+      addToast(`Rename failed: ${err.message || err}`, "rose");
+    }
+  };
+  const removeStore = async (store) => {
+    const shiftCount = (shiftsByStore.get(store.id) || []).length;
+    if (!window.confirm(`Remove store "${store.name}"?${shiftCount > 0 ? ` Its ${shiftCount} scheduled shift${shiftCount === 1 ? "" : "s"} will be deleted too.` : ""} Promoters keep their reported history.`)) return;
+    try {
+      await SupabaseAPI.deleteStore(store.id);
+      addToast(`${store.name} removed`, "rose");
+      reloadStores && reloadStores();
+      reloadStoreShifts && reloadStoreShifts();
+      reloadAssignments && reloadAssignments();
+    } catch (err) {
+      addToast(`Remove failed: ${err.message || err}`, "rose");
+    }
+  };
+  const addShift = async (storeId) => {
+    if (!shiftDraft.date) {
+      addToast("Pick a date for the shift", "amber");
+      return;
+    }
+    try {
+      await SupabaseAPI.createStoreShift(storeId, {
+        date: shiftDraft.date,
+        start: shiftDraft.start || null,
+        end: shiftDraft.end || null
+      });
+      setShiftDraft({ date: "", start: "", end: "" });
+      addToast("Shift added", "green");
+      reloadStoreShifts && reloadStoreShifts();
+    } catch (err) {
+      addToast(`Add shift failed: ${err.message || err}`, "rose");
+    }
+  };
+  const removeShift = async (shift) => {
+    const assigned = (shift.shift_assignments || []).length;
+    if (assigned > 0 && !window.confirm(`This shift has ${assigned} promoter${assigned === 1 ? "" : "s"} assigned. Remove it anyway?`)) return;
+    try {
+      await SupabaseAPI.deleteStoreShift(shift.id);
+      addToast("Shift removed", "rose");
+      reloadStoreShifts && reloadStoreShifts();
+    } catch (err) {
+      addToast(`Remove failed: ${err.message || err}`, "rose");
+    }
+  };
+  const toggleShiftPromoter = async (shift, promoterId, isOn) => {
+    try {
+      if (isOn) await SupabaseAPI.unassignShift(shift.id, promoterId);
+      else await SupabaseAPI.assignShift(shift.id, promoterId);
+      reloadStoreShifts && reloadStoreShifts();
+    } catch (err) {
+      addToast(`Update failed: ${err.message || err}`, "rose");
+    }
+  };
+  // Parse on every keystroke so the preview counts stay live. Errors surface as
+  // a null result rather than throwing while the user is mid-paste.
+  const csvPreview = useMemo(() => {
+    if (!csvText.trim()) return null;
+    try {
+      const parsed = parseJobsCSV(csvText);
+      // Shifts are always inserted (no upsert), so flag the ones that look like
+      // they're already here before the user commits to a double import.
+      const seen = new Set(storeShifts.map((sh) => {
+        const store = stores.find((s) => s.id === sh.store_id);
+        return `${store ? store.name : sh.store_id}|${sh.shift_date}|${sh.start_time || ""}`;
+      }));
+      let duplicates = 0;
+      for (const st of parsed.stores) {
+        for (const sh of st.shifts) {
+          if (seen.has(`${st.name}|${sh.date}|${sh.start ? sh.start + ":00" : ""}`)) duplicates++;
+        }
+      }
+      return { ...parsed, duplicates, error: null };
+    } catch (err) {
+      return { stores: [], skipped: [], shiftCount: 0, duplicates: 0, error: err.message || String(err) };
+    }
+  }, [csvText, storeShifts, stores]);
+  const runImport = async () => {
+    if (!csvPreview || csvPreview.error || !activePromoId) return;
+    setImporting(true);
+    try {
+      const res = await SupabaseAPI.importJobsCSV(activePromoId, csvPreview);
+      addToast(`Imported ${res.shiftsInserted} shift${res.shiftsInserted === 1 ? "" : "s"} \xB7 ${res.storesCreated} new store${res.storesCreated === 1 ? "" : "s"}`, "green");
+      setCsvText("");
+      setCsvFileName("");
+      setCsvOpen(false);
+      reloadStores && reloadStores();
+      reloadStoreShifts && reloadStoreShifts();
+    } catch (err) {
+      addToast(`Import failed: ${err.message || err}`, "rose");
+    } finally {
+      setImporting(false);
+    }
+  };
   const openAdd = () => {
     const nextId = "Q" + (questions.length + 1);
-    setDraft({ id: nextId, question: "", type: "text", clientVisible: false, choices: [], section: "contact" });
+    setDraft({ id: nextId, question: "", type: "text", clientVisible: false, choices: [], section: "shift" });
     setAddOpen(true);
   };
   const openEdit = (q) => {
@@ -5063,7 +5774,7 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
       type: q.type,
       clientVisible: q.clientVisible,
       choices: existingChoices,
-      section: q.section || q.raw && q.raw.section || "contact"
+      section: q.section || q.raw && q.raw.section || "shift"
     });
   };
   const validateBeforeSave = () => {
@@ -5088,7 +5799,7 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
         field_type: draft.type,
         client_visible: draft.clientVisible,
         position: questions.length,
-        section: draft.section || "contact",
+        section: draft.section || "shift",
         choices: draft.type === "multi_choice" ? draft.choices || [] : null
       }).catch((err) => addToast(`Save failed: ${err.message || err}`, "rose"));
     } else if (DATA_SOURCE === "falcon" && activePromoId) {
@@ -5109,8 +5820,8 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
       question: draft.question,
       type: draft.type,
       clientVisible: draft.clientVisible,
-      section: draft.section || "contact",
-      raw: { ...q.raw || {}, section: draft.section || "contact", choices: draft.type === "multi_choice" ? draft.choices : null }
+      section: draft.section || "shift",
+      raw: { ...q.raw || {}, section: draft.section || "shift", choices: draft.type === "multi_choice" ? draft.choices : null }
     } : q));
     setEditing(null);
     addToast("Question updated", "green");
@@ -5119,7 +5830,7 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
         label: draft.question,
         field_type: draft.type,
         client_visible: draft.clientVisible,
-        section: draft.section || "contact",
+        section: draft.section || "shift",
         choices: draft.type === "multi_choice" ? draft.choices || [] : null
       }).catch((err) => addToast(`Update failed: ${err.message || err}`, "rose"));
     } else if (DATA_SOURCE === "falcon" && editing) {
@@ -5155,6 +5866,169 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
     }
   };
   return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+    SectionCard,
+    {
+      title: "Stores & shifts",
+      action: /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-3" }, /* @__PURE__ */ React.createElement("span", { className: "text-xs text-slate-400" }, stores.length, " store", stores.length === 1 ? "" : "s", " \xB7 ", storeShifts.length, " shift", storeShifts.length === 1 ? "" : "s"), activePromoId && /* @__PURE__ */ React.createElement("button", { onClick: () => setCsvOpen(!csvOpen), className: "text-xs font-medium text-blue-600 hover:underline" }, "Import from CSV"))
+    },
+    /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mb-3" }, "Stores are the physical counters/booths for", " ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold text-slate-900" }, activePromoLabel || activePromoId || "this promotion"), ". Each store holds its own scheduled shifts — a promoter can only report on a day they're scheduled."),
+    !activePromoId ? /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" }, "No promotion selected yet — create or pick a promotion first, then come back here to add stores.") : /* @__PURE__ */ React.createElement(React.Fragment, null, csvOpen && /* @__PURE__ */ React.createElement("div", { className: "mb-4 border border-blue-200 bg-blue-50/40 rounded-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-2" }, /* @__PURE__ */ React.createElement("div", { className: "text-sm font-semibold inline-flex items-center gap-1.5" }, /* @__PURE__ */ React.createElement(Boxes, { className: "w-4 h-4 text-blue-700" }), " Import stores & shifts"), /* @__PURE__ */ React.createElement("button", { onClick: () => setCsvOpen(false) }, /* @__PURE__ */ React.createElement(X, { className: "w-4 h-4 text-slate-500" }))), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mb-2" }, "Choose the jobs export (.csv) from the main system. ", /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Job Title"), " becomes the store; each ", /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Shift ID"), " row under it becomes a shift. Cancelled jobs are skipped."), /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 flex-wrap" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "file",
+        accept: ".csv,text/csv",
+        onChange: (e) => {
+          pickCsvFile(e.target.files && e.target.files[0]);
+          e.target.value = "";
+        },
+        className: "text-xs file:mr-2 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:bg-slate-900 file:text-white file:text-xs file:font-medium file:cursor-pointer"
+      }
+    ), csvFileName && /* @__PURE__ */ React.createElement("span", { className: "text-xs text-slate-600 inline-flex items-center gap-1" }, /* @__PURE__ */ React.createElement(FileText, { className: "w-3.5 h-3.5" }), csvFileName)), /* @__PURE__ */ React.createElement("details", { className: "mt-2" }, /* @__PURE__ */ React.createElement("summary", { className: "text-xs text-slate-500 cursor-pointer hover:text-slate-700" }, "or paste the rows instead"), /* @__PURE__ */ React.createElement(
+      "textarea",
+      {
+        value: csvText,
+        onChange: (e) => {
+          setCsvText(e.target.value);
+          setCsvFileName("");
+        },
+        rows: 6,
+        placeholder: "JID,Job Title,Job Type,Shift ID,Shift Date,Shift Start Time,Shift End Time,…",
+        className: "mt-2 w-full border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-slate-900"
+      }
+    )), csvPreview && (csvPreview.error ? /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2" }, csvPreview.error) : /* @__PURE__ */ React.createElement("div", { className: "mt-2 text-xs text-slate-700 space-y-1" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, csvPreview.stores.length), " store", csvPreview.stores.length === 1 ? "" : "s", " \xB7 ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, csvPreview.shiftCount), " shift", csvPreview.shiftCount === 1 ? "" : "s", " ready to import"), csvPreview.duplicates > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-amber-700" }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, csvPreview.duplicates), " of these already exist (same store, date and start time) — importing again will create duplicates."), csvPreview.skipped.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "text-slate-500" }, "Skipped: ", csvPreview.skipped.map((s) => `${s.name} (${s.reason})`).join(", ")))), /* @__PURE__ */ React.createElement("div", { className: "mt-3 flex justify-end gap-2" }, /* @__PURE__ */ React.createElement("button", { onClick: () => {
+      setCsvText("");
+      setCsvFileName("");
+    }, className: "px-3 py-1.5 text-xs border border-slate-300 rounded-lg hover:bg-white" }, "Clear"), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: runImport,
+        disabled: importing || !csvPreview || !!csvPreview.error || csvPreview.shiftCount === 0,
+        className: "px-3 py-1.5 text-xs bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-medium rounded-lg"
+      },
+      importing ? "Importing…" : csvPreview && !csvPreview.error ? `Import ${csvPreview.shiftCount} shifts` : "Import"
+    ))), stores.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 italic mb-3" }, "No stores yet.") : /* @__PURE__ */ React.createElement("ul", { className: "space-y-2 mb-3" }, stores.map((s) => {
+      const list = shiftsByStore.get(s.id) || [];
+      const isOpen = expandedStore === s.id;
+      const isRenaming = renamingStore && renamingStore.id === s.id;
+      return /* @__PURE__ */ React.createElement("li", { key: s.id, className: "border border-slate-200 rounded-lg overflow-hidden" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between px-3 py-2 gap-2" }, isRenaming ? /* @__PURE__ */ React.createElement("div", { className: "flex-1 flex items-center gap-2" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "text",
+          value: renameValue,
+          autoFocus: true,
+          onChange: (e) => setRenameValue(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === "Enter") saveRename();
+            if (e.key === "Escape") setRenamingStore(null);
+          },
+          className: "flex-1 border border-slate-300 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+        }
+      ), /* @__PURE__ */ React.createElement("button", { onClick: saveRename, className: "px-2 py-1 bg-slate-900 text-white text-xs font-medium rounded-lg" }, "Save"), /* @__PURE__ */ React.createElement("button", { onClick: () => setRenamingStore(null), className: "px-2 py-1 text-xs text-slate-500 hover:text-slate-800" }, "Cancel")) : /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => setExpandedStore(isOpen ? null : s.id),
+          className: "flex-1 flex items-center gap-2 text-left min-w-0"
+        },
+        /* @__PURE__ */ React.createElement(ChevronRight, { className: `w-3.5 h-3.5 text-slate-400 shrink-0 transition-transform ${isOpen ? "rotate-90" : ""}` }),
+        /* @__PURE__ */ React.createElement("span", { className: "text-sm font-medium truncate" }, s.name),
+        /* @__PURE__ */ React.createElement("span", { className: "text-xs text-slate-400 shrink-0" }, list.length, " shift", list.length === 1 ? "" : "s")
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => {
+            setRenamingStore(s);
+            setRenameValue(s.name);
+          },
+          className: "p-1 rounded hover:bg-slate-100 text-slate-400 hover:text-slate-700",
+          title: "Rename store"
+        },
+        /* @__PURE__ */ React.createElement(Pencil, { className: "w-3.5 h-3.5" })
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => removeStore(s),
+          className: "p-1 rounded hover:bg-rose-50 text-rose-600",
+          title: "Remove store"
+        },
+        /* @__PURE__ */ React.createElement(X, { className: "w-3.5 h-3.5" })
+      ))), isOpen && /* @__PURE__ */ React.createElement("div", { className: "border-t border-slate-100 bg-slate-50/60 px-3 py-2.5 space-y-2" }, list.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 italic" }, "No shifts scheduled for this store yet.") : list.map((sh) => {
+        const assignedHere = (sh.shift_assignments || []).map((a) => a.promoter_id);
+        return /* @__PURE__ */ React.createElement("div", { key: sh.id, className: "bg-white border border-slate-200 rounded-lg px-2.5 py-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs" }, /* @__PURE__ */ React.createElement("span", { className: "font-semibold text-slate-900" }, fmtShiftDay(sh.shift_date)), (sh.start_time || sh.end_time) && /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, " \xB7 ", [sh.start_time, sh.end_time].filter(Boolean).map((t) => String(t).slice(0, 5)).join(" – "))), /* @__PURE__ */ React.createElement(
+          "button",
+          {
+            onClick: () => removeShift(sh),
+            className: "p-1 rounded hover:bg-rose-50 text-rose-500",
+            title: "Remove shift"
+          },
+          /* @__PURE__ */ React.createElement(X, { className: "w-3 h-3" })
+        )), /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 flex flex-wrap gap-1.5" }, liveAssigned.length === 0 ? /* @__PURE__ */ React.createElement("span", { className: "text-[11px] text-slate-400 italic" }, "Assign promoters to this promotion first") : liveAssigned.map((p) => {
+          const on = assignedHere.includes(p.id);
+          return /* @__PURE__ */ React.createElement(
+            "button",
+            {
+              key: p.id,
+              onClick: () => toggleShiftPromoter(sh, p.id, on),
+              className: `px-2 py-0.5 rounded-full text-[11px] font-medium border ${on ? "bg-emerald-50 border-emerald-300 text-emerald-700" : "bg-white border-slate-300 text-slate-600 hover:bg-slate-50"}`
+            },
+            on ? "✓ " : "+ ",
+            p.name
+          );
+        })));
+      }), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-1.5 pt-1" }, /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "date",
+          value: shiftDraft.date,
+          onChange: (e) => setShiftDraft((d) => ({ ...d, date: e.target.value })),
+          className: "border border-slate-300 rounded-lg px-2 py-1 text-xs"
+        }
+      ), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "time",
+          value: shiftDraft.start,
+          onChange: (e) => setShiftDraft((d) => ({ ...d, start: e.target.value })),
+          className: "border border-slate-300 rounded-lg px-2 py-1 text-xs"
+        }
+      ), /* @__PURE__ */ React.createElement(
+        "input",
+        {
+          type: "time",
+          value: shiftDraft.end,
+          onChange: (e) => setShiftDraft((d) => ({ ...d, end: e.target.value })),
+          className: "border border-slate-300 rounded-lg px-2 py-1 text-xs"
+        }
+      ), /* @__PURE__ */ React.createElement(
+        "button",
+        {
+          onClick: () => addShift(s.id),
+          className: "px-2.5 py-1 bg-slate-900 hover:bg-slate-800 text-white text-xs font-medium rounded-lg"
+        },
+        "Add shift"
+      ))));
+    })),
+    /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "text",
+        value: newStoreName,
+        onChange: (e) => setNewStoreName(e.target.value),
+        onKeyDown: (e) => {
+          if (e.key === "Enter") addStore();
+        },
+        placeholder: "e.g. BER T1 North \xB7 Heinemann DF",
+        className: "flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
+      }
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: addStore,
+        disabled: savingStore || !newStoreName.trim(),
+        className: "px-3 py-1.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white text-sm font-medium rounded-lg"
+      },
+      savingStore ? "Adding…" : "Add"
+    )))
+  ), /* @__PURE__ */ React.createElement(
     SectionCard,
     {
       title: "Promotion products",
@@ -5248,7 +6122,7 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
     )
   ), /* @__PURE__ */ React.createElement(SectionCard, { title: "Custom client-specific questions", action: /* @__PURE__ */ React.createElement("button", { onClick: openAdd, className: "text-xs font-medium text-blue-600 hover:underline" }, "+ Add question") }, /* @__PURE__ */ React.createElement("ul", { className: "space-y-3" }, questions.map((q, idx) => {
     const shortId = q.id && /^Q\d+$/.test(String(q.id)) ? q.id : `Q${idx + 1}`;
-    return /* @__PURE__ */ React.createElement("li", { key: q.id, className: "border border-slate-200 rounded-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-1 flex-wrap" }, /* @__PURE__ */ React.createElement("span", { title: String(q.id) }, /* @__PURE__ */ React.createElement(Pill, { tone: "rose" }, shortId)), /* @__PURE__ */ React.createElement(Pill, { tone: "slate" }, q.type), /* @__PURE__ */ React.createElement(Pill, { tone: (q.section || "contact") === "shift" ? "amber" : "blue" }, (q.section || "contact") === "shift" ? "Per shift" : "Per contact"), /* @__PURE__ */ React.createElement("button", { onClick: () => toggleVisibility(q.id), className: "focus:outline-none" }, q.clientVisible ? /* @__PURE__ */ React.createElement(Pill, { tone: "green" }, "Client-visible") : /* @__PURE__ */ React.createElement(Pill, { tone: "slate" }, "Internal only"))), /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-900" }, q.question), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mt-1" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, "Latest response:"), " ", String(q.response))), /* @__PURE__ */ React.createElement("button", { onClick: () => openEdit(q), className: "text-xs text-slate-500 hover:text-slate-900" }, "Edit")));
+    return /* @__PURE__ */ React.createElement("li", { key: q.id, className: "border border-slate-200 rounded-lg p-3" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-start justify-between gap-3" }, /* @__PURE__ */ React.createElement("div", { className: "min-w-0" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center gap-2 mb-1 flex-wrap" }, /* @__PURE__ */ React.createElement("span", { title: String(q.id) }, /* @__PURE__ */ React.createElement(Pill, { tone: "rose" }, shortId)), /* @__PURE__ */ React.createElement(Pill, { tone: "slate" }, q.type), /* @__PURE__ */ /* @__PURE__ */ React.createElement("button", { onClick: () => toggleVisibility(q.id), className: "focus:outline-none" }, q.clientVisible ? /* @__PURE__ */ React.createElement(Pill, { tone: "green" }, "Client-visible") : /* @__PURE__ */ React.createElement(Pill, { tone: "slate" }, "Internal only"))), /* @__PURE__ */ React.createElement("div", { className: "text-sm font-medium text-slate-900" }, q.question), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 mt-1" }, /* @__PURE__ */ React.createElement("span", { className: "text-slate-500" }, "Latest response:"), " ", String(q.response))), /* @__PURE__ */ React.createElement("button", { onClick: () => openEdit(q), className: "text-xs text-slate-500 hover:text-slate-900" }, "Edit")));
   }), questions.length === 0 && /* @__PURE__ */ React.createElement("li", { className: "text-sm text-slate-500 italic" }, "No custom questions configured.")), /* @__PURE__ */ React.createElement("div", { className: "mt-4 text-xs text-slate-500" }, 'Questions are scoped per promotion and can be edited mid-pilot. Toggle the "client-visible" badge to control whether answers appear in the client report.')), /* @__PURE__ */ React.createElement(
     Modal,
     {
@@ -5289,7 +6163,7 @@ function ManagerConfig({ activePromoId, activePromoLabel, activeProject, hero, o
       },
       /* @__PURE__ */ React.createElement(Plus, { className: "w-3 h-3" }),
       " Add promoter"
-    )), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, DATA_SOURCE === "supabase" ? liveAssigned.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 italic" }, 'No promoters assigned yet. Tap "Add promoter" to assign one.') : liveAssigned.map((p) => /* @__PURE__ */ React.createElement("div", { key: p.id, className: "flex items-center gap-2 border border-slate-200 rounded-full pl-1 pr-2 py-1 group" }, /* @__PURE__ */ React.createElement("div", { className: "w-6 h-6 rounded-full bg-slate-900 text-white text-xs flex items-center justify-center font-semibold" }, p.initials), /* @__PURE__ */ React.createElement("span", { className: "text-sm" }, p.name), p.email && /* @__PURE__ */ React.createElement("span", { className: "text-xs text-slate-500" }, "\xB7 ", p.email), /* @__PURE__ */ React.createElement(
+    )), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap gap-2" }, DATA_SOURCE === "supabase" ? liveAssigned.length === 0 ? /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-500 italic" }, 'No promoters assigned yet. Tap "Add promoter" to assign one.') : liveAssigned.map((p) => /* @__PURE__ */ React.createElement("div", { key: p.id, className: "flex items-center gap-2 border border-slate-200 rounded-full pl-1 pr-2 py-1 group" }, /* @__PURE__ */ React.createElement("div", { className: "w-6 h-6 rounded-full bg-slate-900 text-white text-xs flex items-center justify-center font-semibold" }, p.initials), /* @__PURE__ */ React.createElement("span", { className: "text-sm" }, p.name), p.email && /* @__PURE__ */ React.createElement("span", { className: "text-xs text-slate-500" }, "\xB7 ", p.email), p.shiftCount > 0 ? /* @__PURE__ */ React.createElement(Pill, { tone: "blue" }, p.shiftCount, " shift", p.shiftCount === 1 ? "" : "s") : /* @__PURE__ */ React.createElement("span", { className: "text-xs text-amber-600 italic" }, "no shifts"), /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => unassign(p.id, p.name),
@@ -5582,19 +6456,7 @@ function QuestionForm({ draft, setDraft }) {
     const arr = s.split("\n").map((x) => x.trim()).filter(Boolean);
     setDraft({ ...draft, choices: arr });
   };
-  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3 text-sm" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Question ID"), /* @__PURE__ */ React.createElement("input", { value: draft.id, onChange: (e) => setDraft({ ...draft, id: e.target.value }), className: "mt-1 w-full border border-slate-300 rounded-lg px-3 py-2" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Question text"), /* @__PURE__ */ React.createElement("textarea", { value: draft.question, onChange: (e) => setDraft({ ...draft, question: e.target.value }), rows: 2, placeholder: "e.g. How many customers asked for the 100ml format?", className: "mt-1 w-full border border-slate-300 rounded-lg px-3 py-2" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Answer type"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex gap-1.5" }, TYPES.map(([v, l]) => /* @__PURE__ */ React.createElement("button", { key: v, onClick: () => setDraft({ ...draft, type: v }), className: `px-3 py-1.5 rounded-lg text-xs font-medium border ${draft.type === v ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-300"}` }, l)))), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Where to ask it"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 grid grid-cols-2 gap-1.5" }, [
-    ["contact", "Per contact", "Inline in the contact form \u2014 one answer per customer"],
-    ["shift", "Per shift", "On Feedback & Insights \u2014 one answer per shift"]
-  ].map(([v, l, hint]) => /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      key: v,
-      onClick: () => setDraft({ ...draft, section: v }),
-      className: `text-left rounded-lg border px-3 py-2 ${(draft.section || "contact") === v ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-300"}`
-    },
-    /* @__PURE__ */ React.createElement("div", { className: "text-xs font-semibold" }, l),
-    /* @__PURE__ */ React.createElement("div", { className: `text-[10px] mt-0.5 ${(draft.section || "contact") === v ? "text-slate-300" : "text-slate-500"}` }, hint)
-  )))), draft.type === "multi_choice" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Answer options"), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { className: "space-y-3 text-sm" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Question ID"), /* @__PURE__ */ React.createElement("input", { value: draft.id, onChange: (e) => setDraft({ ...draft, id: e.target.value }), className: "mt-1 w-full border border-slate-300 rounded-lg px-3 py-2" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Question text"), /* @__PURE__ */ React.createElement("textarea", { value: draft.question, onChange: (e) => setDraft({ ...draft, question: e.target.value }), rows: 2, placeholder: "e.g. How many customers asked for the 100ml format?", className: "mt-1 w-full border border-slate-300 rounded-lg px-3 py-2" })), /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Answer type"), /* @__PURE__ */ React.createElement("div", { className: "mt-1 flex gap-1.5" }, TYPES.map(([v, l]) => /* @__PURE__ */ React.createElement("button", { key: v, onClick: () => setDraft({ ...draft, type: v }), className: `px-3 py-1.5 rounded-lg text-xs font-medium border ${draft.type === v ? "bg-slate-900 text-white border-slate-900" : "bg-white text-slate-700 border-slate-300"}` }, l)))), /* @__PURE__ */ React.createElement("div", { className: "text-[11px] text-slate-500 bg-slate-50 border border-slate-100 rounded-lg px-3 py-2" }, "Asked once per shift, on the promoter's daily report."), draft.type === "multi_choice" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("label", { className: "text-xs font-medium text-slate-700" }, "Answer options"), /* @__PURE__ */ React.createElement(
     "textarea",
     {
       value: choicesText,

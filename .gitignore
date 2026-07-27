@@ -1,0 +1,15 @@
+# Jobs exports from the main system contain store addresses, contact people and
+# phone numbers — import them through the UI instead of committing them.
+Jobs_PID_*.csv
+*_export.csv
+
+# Local Supabase state and generated temp files
+supabase/.temp/
+supabase/.branches/
+
+# Local editor/agent config with machine-specific absolute paths
+.claude/
+
+# Never commit keys
+.env
+.env.*
