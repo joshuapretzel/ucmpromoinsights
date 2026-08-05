@@ -3349,6 +3349,11 @@ function PromoterApp({ onExit, userEmail }) {
   // The two tap counters that replaced per-customer logging. Kept as plain
   // running totals on the shift row so a student only ever taps + / -.
   const [counters, setCounters] = useState(isLive ? { approached: 0, raffle: 0 } : { approached: 63, raffle: 21 });
+  // Guards against the counters being auto-saved before we've loaded the value
+  // that's already in the DB. Without this the initial {0,0} could overwrite a
+  // real count on a reload where the load is slow or fails. "error" means the
+  // load failed and we must not let the student tap on a phantom 0.
+  const [countersLoad, setCountersLoad] = useState(isLive ? "loading" : "ready");
   const [contacts, setContacts] = useState(() => {
     if (isLive) return { entries: [], total: 0, female: 0, male: 0, mixed: 0, ageMain: "" };
     const demoEntries = [
@@ -3393,7 +3398,7 @@ function PromoterApp({ onExit, userEmail }) {
   const clearDrafts = () => {
     if (!liveShift.shiftId) return;
     try {
-      ["feedback", "checklist", "customAnswers"].forEach((kind) => {
+      ["feedback", "checklist", "customAnswers", "counters"].forEach((kind) => {
         localStorage.removeItem(draftKey(kind));
       });
     } catch {
@@ -3413,10 +3418,13 @@ function PromoterApp({ onExit, userEmail }) {
     let cancelled = false;
     (async () => {
       try {
+        // getShift is deliberately NOT caught here: its result carries the
+        // saved counters, so a failed load must fall through to the catch and
+        // the local-backup path rather than silently look like "0 counted".
         const [notes, answers, shift] = await Promise.all([
           SupabaseAPI.listShiftFeedbackNotes(liveShift.shiftId).catch(() => []),
           SupabaseAPI.listShiftCustomAnswers(liveShift.shiftId).catch(() => []),
-          SupabaseAPI.getShift(liveShift.shiftId).catch(() => null)
+          SupabaseAPI.getShift(liveShift.shiftId)
         ]);
         if (cancelled) return;
         const fb = { note: "", quote: "", reasons: [], missing: "", lostRev: 0 };
@@ -3439,10 +3447,17 @@ function PromoterApp({ onExit, userEmail }) {
         }
         if (Object.keys(ca).length > 0) setCustomAnswers((prev) => ({ ...prev, ...ca }));
         if (shift) {
+          // Reconcile the DB value with the local backup and keep the HIGHER of
+          // the two. This is the guarantee the promoter cares about: a stale or
+          // failed read can never drop the count, and a cleared browser cache
+          // can never drop it either. A legitimate minus lands in both places,
+          // so max() doesn't undo it.
+          const local = readDraft("counters", null) || {};
           setCounters({
-            approached: Number(shift.contacts_total) || 0,
-            raffle: Number(shift.raffle_entries) || 0
+            approached: Math.max(Number(shift.contacts_total) || 0, Number(local.approached) || 0),
+            raffle: Math.max(Number(shift.raffle_entries) || 0, Number(local.raffle) || 0)
           });
+          setCountersLoad("ready");
           setChecklist((prev) => ({
             ...prev,
             briefingRead: !!shift.briefing_read || prev.briefingRead,
@@ -3456,8 +3471,21 @@ function PromoterApp({ onExit, userEmail }) {
           if (shift.status === "submitted" || shift.status === "approved") {
             setSubmitted(true);
           }
+        } else {
+          setCountersLoad("error");
         }
       } catch (_) {
+        if (cancelled) return;
+        // The saved value couldn't be loaded. Fall back to the local backup if
+        // there is one so the student sees their real number; otherwise lock the
+        // counter rather than showing a tap-ready 0 they'd overwrite.
+        const local = readDraft("counters", null);
+        if (local && (Number(local.approached) || Number(local.raffle))) {
+          setCounters({ approached: Number(local.approached) || 0, raffle: Number(local.raffle) || 0 });
+          setCountersLoad("ready");
+        } else {
+          setCountersLoad("error");
+        }
       }
     })();
     return () => {
@@ -3476,9 +3504,18 @@ function PromoterApp({ onExit, userEmail }) {
     if (!isLive || !liveShift.shiftId) return;
     writeDraft("customAnswers", customAnswers);
   }, [isLive, liveShift.shiftId, customAnswers]);
+  // Synchronous local backup of the counters on every change. localStorage can't
+  // race or fail the way a network PATCH can, so this is the source that lets a
+  // reload recover even when the DB round-trip is slow or offline. Only written
+  // once the real value is loaded, so it never records a phantom 0.
+  useEffect(() => {
+    if (!isLive || !liveShift.shiftId || countersLoad !== "ready") return;
+    writeDraft("counters", counters);
+  }, [isLive, liveShift.shiftId, counters, countersLoad]);
   const hydratedRef = useRef(false);
   useEffect(() => {
     hydratedRef.current = false;
+    if (isLive) setCountersLoad(liveShift.shiftId ? "loading" : "ready");
   }, [liveShift.shiftId]);
   useEffect(() => {
     if (!isLive || !liveShift.shiftId) return;
@@ -3501,14 +3538,19 @@ function PromoterApp({ onExit, userEmail }) {
   }, [isLive, liveShift.shiftId, checklist]);
   // Counters save themselves as they're tapped — a student shouldn't have to
   // remember to press save, and the numbers must survive closing the app.
+  //
+  // Critically, this is gated on countersLoad === "ready": we must never PATCH
+  // the row until we've actually loaded what's already stored, or the initial
+  // {0,0} could overwrite a real count on a slow/failed load. (The old shared
+  // hydratedRef latch was consumed by the feedback autosave before this effect
+  // ever saw it, which is exactly how counters got zeroed on reload.)
   useEffect(() => {
-    if (!isLive || !liveShift.shiftId) return;
-    if (!hydratedRef.current) return;
+    if (!isLive || !liveShift.shiftId || countersLoad !== "ready") return;
     const t = setTimeout(() => {
       SupabaseAPI.saveCounters(liveShift.shiftId, counters).catch((err) => console.warn("counter auto-save failed:", err && err.message ? err.message : err));
     }, 800);
     return () => clearTimeout(t);
-  }, [isLive, liveShift.shiftId, counters]);
+  }, [isLive, liveShift.shiftId, counters, countersLoad]);
   useEffect(() => {
     if (!isLive || !liveShift.shiftId) return;
     if (!hydratedRef.current) return;
@@ -3598,6 +3640,7 @@ function PromoterApp({ onExit, userEmail }) {
       setContacts,
       counters,
       setCounters,
+      countersLoad,
       feedback,
       setFeedback,
       customAnswers,
@@ -3794,17 +3837,22 @@ function CounterBlock({ label, hint, value, onChange, tone = "blue", disabled = 
     /* @__PURE__ */ React.createElement(Plus, { className: "w-6 h-6" })
   )));
 }
-function TrackerCounters({ counters, setCounters, shiftId, shiftLoading }) {
+function TrackerCounters({ counters, setCounters, countersLoad = "ready", shiftId, shiftLoading }) {
   const isLive = DATA_SOURCE === "supabase";
-  const blocked = isLive && !shiftId;
+  const noShift = isLive && !shiftId;
+  const loading = isLive && !noShift && countersLoad === "loading";
+  const loadError = isLive && !noShift && countersLoad === "error";
+  // Disable tapping unless we've actually loaded the saved value. Tapping on a
+  // not-yet-loaded 0 is exactly what let a reload overwrite a real count.
+  const blocked = noShift || loading || loadError;
   const set = (key) => (v) => {
     if (blocked) {
-      addToast(shiftLoading ? "Still opening your shift — one moment" : "No shift scheduled today — nothing to log", "amber");
+      addToast(noShift ? "No shift scheduled today — nothing to log" : loadError ? "Gespeicherter Stand nicht geladen — bitte neu laden" : "Zähler wird geladen — einen Moment", "amber");
       return;
     }
     setCounters((c) => ({ ...c, [key]: v }));
   };
-  return /* @__PURE__ */ React.createElement("div", { className: "px-5 py-5 space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: "font-semibold" }, "Zähler"), /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mt-1" }, "Tippe mit — die Zahlen speichern sich automatisch.")), blocked && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" }, shiftLoading ? "Opening your shift…" : "No shift scheduled for today, so nothing can be logged."), /* @__PURE__ */ React.createElement(CounterBlock, {
+  return /* @__PURE__ */ React.createElement("div", { className: "px-5 py-5 space-y-4" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("h3", { className: "font-semibold" }, "Zähler"), /* @__PURE__ */ React.createElement("p", { className: "text-xs text-slate-500 mt-1" }, "Tippe mit — die Zahlen speichern sich automatisch.")), noShift && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2" }, shiftLoading ? "Opening your shift…" : "No shift scheduled for today, so nothing can be logged."), loading && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 flex items-center gap-2" }, /* @__PURE__ */ React.createElement("span", { className: "inline-block w-3 h-3 border-2 border-slate-300 border-t-slate-600 rounded-full animate-spin" }), "Dein gespeicherter Stand wird geladen…"), loadError && /* @__PURE__ */ React.createElement("div", { className: "text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2" }, "Dein gespeicherter Zählerstand konnte nicht geladen werden. Bitte die Seite neu laden, bevor du weiterzählst — sonst gehen Zahlen verloren."), /* @__PURE__ */ React.createElement(CounterBlock, {
     label: "Angesprochen",
     hint: "Personen, die du angesprochen hast",
     value: counters.approached || 0,
