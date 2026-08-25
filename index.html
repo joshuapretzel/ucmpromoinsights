@@ -686,9 +686,11 @@ var SupabaseAPI = {
   },
   listCustomAnswers: async (promotionId) => {
     if (!promotionId) return [];
-    const { data, error } = await supabase.from("custom_question_answers").select("id, answer_json, recorded_at, shift_id, question_id, custom_questions!inner(id, label, field_type, client_visible, promotion_id)").eq("custom_questions.promotion_id", promotionId).order("recorded_at", { ascending: true });
-    if (error) throw new Error(error.message);
-    return data || [];
+    // Must page through: PostgREST caps a single response at 1000 rows, and a
+    // busy promotion easily exceeds that. Without pagination the ascending sort
+    // means the NEWEST answers get dropped first — exactly the ones a report
+    // about recent shifts needs. fetchAllRows keeps requesting until drained.
+    return await fetchAllRows((from, to) => supabase.from("custom_question_answers").select("id, answer_json, recorded_at, shift_id, question_id, custom_questions!inner(id, label, field_type, client_visible, promotion_id)").eq("custom_questions.promotion_id", promotionId).order("recorded_at", { ascending: true }).range(from, to));
   },
   // -- PROMOTER MESSAGES -------------------------------------
   // Persistent manager→promoter message bus.  Used when DATA_SOURCE
