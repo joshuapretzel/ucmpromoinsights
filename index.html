@@ -512,15 +512,18 @@ var SupabaseAPI = {
     if (error) throw new Error(error.message);
     return count || 0;
   },
-  // Delete any shift rows for a promoter on a promotion that have NO child
-  // sales and NO child feedback notes. Returns the number of shifts removed.
-  // Called from the manager "remove promoter" flow when the promoter never
-  // recorded any sales — keeps the data set clean instead of leaving empty
-  // planned/active shift rows behind that pollute promoter dashboards.
+  // Delete shift rows for a promoter that carry NO recorded data at all — used
+  // by the manager "remove promoter" flow to clean up empty planned/active
+  // shifts. "Empty" must consider EVERY kind of child data, not just sales:
+  // a shift can hold interactions, question answers, feedback, photos or the
+  // two counters without a single sale, and deleting it would cascade all of
+  // that away (this is a real data-loss vector). Anything with any child data
+  // or a non-zero counter is kept.
   deleteEmptyShiftsForPromoter: async (promotionId, promoterId) => {
-    const { data: shifts, error: e1 } = await supabase.from("shifts").select("id, sales(id), feedback_notes(id)").eq("promotion_id", promotionId).eq("promoter_id", promoterId);
+    const { data: shifts, error: e1 } = await supabase.from("shifts").select("id, contacts_total, raffle_entries, sales(id), feedback_notes(id), customer_interactions(id), custom_question_answers(id), shift_photos(id)").eq("promotion_id", promotionId).eq("promoter_id", promoterId);
     if (e1) throw new Error(e1.message);
-    const emptyIds = (shifts || []).filter((s) => (!s.sales || s.sales.length === 0) && (!s.feedback_notes || s.feedback_notes.length === 0)).map((s) => s.id);
+    const isEmpty = (s) => (!s.sales || s.sales.length === 0) && (!s.feedback_notes || s.feedback_notes.length === 0) && (!s.customer_interactions || s.customer_interactions.length === 0) && (!s.custom_question_answers || s.custom_question_answers.length === 0) && (!s.shift_photos || s.shift_photos.length === 0) && !Number(s.contacts_total) && !Number(s.raffle_entries);
+    const emptyIds = (shifts || []).filter(isEmpty).map((s) => s.id);
     if (emptyIds.length === 0) return 0;
     const { error: e2 } = await supabase.from("shifts").delete().in("id", emptyIds);
     if (e2) throw new Error(e2.message);
@@ -566,7 +569,12 @@ var SupabaseAPI = {
     return data;
   },
   deleteCustomQuestion: async (id) => {
-    const { error } = await supabase.from("custom_questions").delete().eq("id", id);
+    // Soft-delete only. A hard DELETE cascades away every answer ever given to
+    // this question (confirmed prod incident: 30 answers lost this way). Setting
+    // active=false hides it from the promoter form and from reports
+    // (listCustomQuestions filters active=true) while the answers stay intact
+    // and the question can be reactivated later.
+    const { error } = await supabase.from("custom_questions").update({ active: false }).eq("id", id);
     if (error) throw new Error(error.message);
     return null;
   },
