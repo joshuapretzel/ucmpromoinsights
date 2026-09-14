@@ -637,15 +637,21 @@ var SupabaseAPI = {
   // are untouched.
   saveShiftAnswers: async (shiftId, shiftQuestions, customAnswers) => {
     if (!shiftId || !Array.isArray(shiftQuestions) || shiftQuestions.length === 0) return;
-    const qIds = shiftQuestions.map((q) => q && q.id).filter(Boolean);
-    if (qIds.length === 0) return;
-    await supabase.from("custom_question_answers").delete().eq("shift_id", shiftId).is("customer_interaction_id", null).in("question_id", qIds);
+    const ca = customAnswers || {};
+    // Only touch questions the promoter actually interacted with (key present,
+    // even if now blank). This lets a deliberate clear persist, while an
+    // unhydrated/empty customAnswers (no keys) touches nothing — so a reload
+    // can never wipe saved answers. Blank values delete without re-inserting.
+    const touched = shiftQuestions.filter((q) => q && q.id && Object.prototype.hasOwnProperty.call(ca, q.id));
+    if (touched.length === 0) return;
+    const touchedIds = touched.map((q) => q.id);
     const rows = [];
-    for (const q of shiftQuestions) {
-      const v = customAnswers ? customAnswers[q.id] : void 0;
+    for (const q of touched) {
+      const v = ca[q.id];
       if (v === void 0 || v === null || v === "") continue;
       rows.push({ shift_id: shiftId, question_id: q.id, answer_json: { value: v }, customer_interaction_id: null });
     }
+    await supabase.from("custom_question_answers").delete().eq("shift_id", shiftId).is("customer_interaction_id", null).in("question_id", touchedIds);
     if (rows.length > 0) {
       const { error } = await supabase.from("custom_question_answers").insert(rows);
       if (error) throw new Error(error.message);
@@ -3358,6 +3364,12 @@ function PromoterApp({ onExit, userEmail }) {
   // real count on a reload where the load is slow or fails. "error" means the
   // load failed and we must not let the student tap on a phantom 0.
   const [countersLoad, setCountersLoad] = useState(isLive ? "loading" : "ready");
+  // Same guard for the daily-report answers as for the counters. The answer
+  // auto-save does a destructive delete-then-insert; if it runs before the
+  // saved answers have hydrated (e.g. right after a reload, when customAnswers
+  // is still {}), it deletes the promoter's real answers and inserts nothing.
+  // Gate the auto-save on this being "ready".
+  const [answersLoad, setAnswersLoad] = useState(isLive ? "loading" : "ready");
   const [contacts, setContacts] = useState(() => {
     if (isLive) return { entries: [], total: 0, female: 0, male: 0, mixed: 0, ageMain: "" };
     const demoEntries = [
@@ -3450,6 +3462,9 @@ function PromoterApp({ onExit, userEmail }) {
           if (raw !== void 0 && raw !== null && raw !== "") ca[a.question_id] = raw;
         }
         if (Object.keys(ca).length > 0) setCustomAnswers((prev) => ({ ...prev, ...ca }));
+        // Answers are now hydrated (DB merged over the local draft loaded
+        // earlier) — the auto-save may run from here on.
+        setAnswersLoad("ready");
         if (shift) {
           // Reconcile the DB value with the local backup and keep the HIGHER of
           // the two. This is the guarantee the promoter cares about: a stale or
@@ -3490,6 +3505,10 @@ function PromoterApp({ onExit, userEmail }) {
         } else {
           setCountersLoad("error");
         }
+        // Even on a failed load, allow answer edits to save again — the local
+        // draft (loaded separately) is what's in customAnswers, and the
+        // empty-set guard in saveShiftAnswers prevents an accidental wipe.
+        setAnswersLoad("ready");
       }
     })();
     return () => {
@@ -3519,7 +3538,10 @@ function PromoterApp({ onExit, userEmail }) {
   const hydratedRef = useRef(false);
   useEffect(() => {
     hydratedRef.current = false;
-    if (isLive) setCountersLoad(liveShift.shiftId ? "loading" : "ready");
+    if (isLive) {
+      setCountersLoad(liveShift.shiftId ? "loading" : "ready");
+      setAnswersLoad(liveShift.shiftId ? "loading" : "ready");
+    }
   }, [liveShift.shiftId]);
   useEffect(() => {
     if (!isLive || !liveShift.shiftId) return;
@@ -3556,15 +3578,14 @@ function PromoterApp({ onExit, userEmail }) {
     return () => clearTimeout(t);
   }, [isLive, liveShift.shiftId, counters, countersLoad]);
   useEffect(() => {
-    if (!isLive || !liveShift.shiftId) return;
-    if (!hydratedRef.current) return;
+    if (!isLive || !liveShift.shiftId || answersLoad !== "ready") return;
     const shiftQs = (customQuestions || []).filter((q) => q && q.id);
     if (shiftQs.length === 0) return;
     const t = setTimeout(() => {
       SupabaseAPI.saveShiftAnswers(liveShift.shiftId, shiftQs, customAnswers).catch((err) => console.warn("shift answers auto-save failed:", err && err.message ? err.message : err));
     }, 1e3);
     return () => clearTimeout(t);
-  }, [isLive, liveShift.shiftId, customAnswers, customQuestions]);
+  }, [isLive, liveShift.shiftId, customAnswers, customQuestions, answersLoad]);
   useEffect(() => {
     if (!isLive || !liveShift.shiftId) return;
     let cancelled = false;
