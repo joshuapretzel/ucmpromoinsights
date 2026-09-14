@@ -3370,6 +3370,15 @@ function PromoterApp({ onExit, userEmail }) {
   // is still {}), it deletes the promoter's real answers and inserts nothing.
   // Gate the auto-save on this being "ready".
   const [answersLoad, setAnswersLoad] = useState(isLive ? "loading" : "ready");
+  // Same guard again for feedback and checklist. saveFeedbackSnapshot does a
+  // destructive delete-then-insert on feedback_notes, so an empty auto-save
+  // before hydration wipes the promoter's notes (same bug that ate the counters
+  // and the answers). saveChecklistFlags is non-destructive but can still flip a
+  // saved briefing_read/checklist_complete back to false pre-hydration. These
+  // replace the old shared hydratedRef latch, which only worked if the feedback
+  // effect happened to run before the checklist effect.
+  const [feedbackLoad, setFeedbackLoad] = useState(isLive ? "loading" : "ready");
+  const [checklistLoad, setChecklistLoad] = useState(isLive ? "loading" : "ready");
   const [contacts, setContacts] = useState(() => {
     if (isLive) return { entries: [], total: 0, female: 0, male: 0, mixed: 0, ageMain: "" };
     const demoEntries = [
@@ -3455,6 +3464,9 @@ function PromoterApp({ onExit, userEmail }) {
         }
         const hasFbInDb = (notes || []).length > 0;
         if (hasFbInDb) setFeedback((prev) => ({ ...prev, ...fb }));
+        // Feedback is now hydrated (empty DB feedback is a valid loaded state
+        // too) — its destructive auto-save may run from here on.
+        setFeedbackLoad("ready");
         const ca = {};
         for (const a of answers || []) {
           if (!a || a.customer_interaction_id) continue;
@@ -3487,6 +3499,7 @@ function PromoterApp({ onExit, userEmail }) {
             photo: shift.checklist_complete ? true : prev.photo,
             stockConfirmed: shift.checklist_complete ? true : prev.stockConfirmed
           }));
+          setChecklistLoad("ready");
           if (shift.status === "submitted" || shift.status === "approved") {
             setSubmitted(true);
           }
@@ -3509,6 +3522,13 @@ function PromoterApp({ onExit, userEmail }) {
         // draft (loaded separately) is what's in customAnswers, and the
         // empty-set guard in saveShiftAnswers prevents an accidental wipe.
         setAnswersLoad("ready");
+        // Feedback and checklist saves are destructive / regressive. Only
+        // re-enable them if a local draft was loaded (which IS the promoter's
+        // own data, so re-saving reconstructs it). With no draft the DB content
+        // never hydrated, so stay gated rather than let an empty save wipe or
+        // downgrade whatever is on the server.
+        if (readDraft("feedback", null)) setFeedbackLoad("ready");
+        if (readDraft("checklist", null)) setChecklistLoad("ready");
       }
     })();
     return () => {
@@ -3535,33 +3555,33 @@ function PromoterApp({ onExit, userEmail }) {
     if (!isLive || !liveShift.shiftId || countersLoad !== "ready") return;
     writeDraft("counters", counters);
   }, [isLive, liveShift.shiftId, counters, countersLoad]);
-  const hydratedRef = useRef(false);
   useEffect(() => {
-    hydratedRef.current = false;
     if (isLive) {
       setCountersLoad(liveShift.shiftId ? "loading" : "ready");
       setAnswersLoad(liveShift.shiftId ? "loading" : "ready");
+      setFeedbackLoad(liveShift.shiftId ? "loading" : "ready");
+      setChecklistLoad(liveShift.shiftId ? "loading" : "ready");
     }
   }, [liveShift.shiftId]);
+  // Gated on feedbackLoad === "ready": saveFeedbackSnapshot deletes every
+  // feedback_note for the shift before re-inserting, so it must never run until
+  // the saved notes have hydrated, or an empty pre-load state wipes them.
   useEffect(() => {
-    if (!isLive || !liveShift.shiftId) return;
-    if (!hydratedRef.current) {
-      hydratedRef.current = true;
-      return;
-    }
+    if (!isLive || !liveShift.shiftId || feedbackLoad !== "ready") return;
     const t = setTimeout(() => {
       SupabaseAPI.saveFeedbackSnapshot(liveShift.shiftId, feedback).catch((err) => console.warn("feedback auto-save failed:", err && err.message ? err.message : err));
     }, 1e3);
     return () => clearTimeout(t);
-  }, [isLive, liveShift.shiftId, feedback]);
+  }, [isLive, liveShift.shiftId, feedback, feedbackLoad]);
+  // Gated on checklistLoad === "ready": a pre-hydration save would push the
+  // initial false flags over a saved briefing_read/checklist_complete = true.
   useEffect(() => {
-    if (!isLive || !liveShift.shiftId) return;
-    if (!hydratedRef.current) return;
+    if (!isLive || !liveShift.shiftId || checklistLoad !== "ready") return;
     const t = setTimeout(() => {
       SupabaseAPI.saveChecklistFlags(liveShift.shiftId, checklist).catch((err) => console.warn("checklist auto-save failed:", err && err.message ? err.message : err));
     }, 1e3);
     return () => clearTimeout(t);
-  }, [isLive, liveShift.shiftId, checklist]);
+  }, [isLive, liveShift.shiftId, checklist, checklistLoad]);
   // Counters save themselves as they're tapped — a student shouldn't have to
   // remember to press save, and the numbers must survive closing the app.
   //
