@@ -4538,46 +4538,6 @@ function TrackerSubmit({ setScreen, sales, contacts, counters = { approached: 0,
 }, customQuestions, checklist, shiftRevenue, shiftUnits, submitted, setSubmitted, clearDrafts = () => {
 }, shiftId }) {
   const [submitting, setSubmitting] = useState(false);
-  const [saving, setSaving] = useState(false);
-  // Manual full flush of every section to the DB, WITHOUT touching status or
-  // end_time. This is the fallback for the case where a debounced auto-save
-  // silently failed (those only console.warn) — the promoter can force a write
-  // and, unlike auto-save, actually SEES whether it worked. Reused before and
-  // after submit.
-  const flushAll = async () => {
-    await SupabaseAPI.saveFeedbackSnapshot(shiftId, feedback || {});
-    const shiftQs = (customQuestions || []).filter((q) => q && q.id);
-    if (shiftQs.length > 0) {
-      await SupabaseAPI.saveShiftAnswers(shiftId, shiftQs, customAnswers || {});
-    }
-    await SupabaseAPI.saveCounters(shiftId, counters || { approached: 0, raffle: 0 });
-    await SupabaseAPI.saveChecklistFlags(shiftId, checklist || {});
-    if (typeof samples !== "undefined" && samples) {
-      await SupabaseAPI.updateShift(shiftId, {
-        samples_discovery_mini: Number(samples.discoveryMini) || 0,
-        samples_body_lotion: Number(samples.bodyLotion) || 0
-      });
-    }
-  };
-  const handleSaveNow = async () => {
-    if (DATA_SOURCE !== "supabase") {
-      addToast("Gespeichert (Demo)", "green");
-      return;
-    }
-    if (!shiftId) {
-      addToast("Keine Schicht — es gibt nichts zu speichern", "rose");
-      return;
-    }
-    setSaving(true);
-    try {
-      await flushAll();
-      addToast("Alles gespeichert", "green");
-    } catch (err) {
-      addToast(`Speichern fehlgeschlagen: ${err && err.message ? err.message : err}`, "rose");
-    } finally {
-      setSaving(false);
-    }
-  };
   const handleSubmit = async () => {
     if (DATA_SOURCE !== "supabase") {
       setSubmitted(true);
@@ -4677,37 +4637,17 @@ function TrackerSubmit({ setScreen, sales, contacts, counters = { approached: 0,
         className: "w-full border border-slate-300 rounded-lg px-3 py-2 text-sm"
       }
     ));
-  })), feedback && feedback.quote && /* @__PURE__ */ React.createElement("div", { className: "border-l-2 border-amber-400 bg-amber-50 rounded-r-lg px-3 py-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 uppercase tracking-wide font-semibold" }, "Quote to share"), /* @__PURE__ */ React.createElement("div", { className: "text-sm italic text-slate-800 mt-1" }, '"', feedback.quote, '"')), !submitted ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+  })), feedback && feedback.quote && /* @__PURE__ */ React.createElement("div", { className: "border-l-2 border-amber-400 bg-amber-50 rounded-r-lg px-3 py-2.5" }, /* @__PURE__ */ React.createElement("div", { className: "text-xs text-amber-700 uppercase tracking-wide font-semibold" }, "Quote to share"), /* @__PURE__ */ React.createElement("div", { className: "text-sm italic text-slate-800 mt-1" }, '"', feedback.quote, '"')), !submitted ? /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: handleSubmit,
-      disabled: submitting || saving,
+      disabled: submitting,
       className: "w-full bg-slate-900 hover:bg-slate-800 disabled:bg-slate-400 text-white rounded-xl py-3 px-4 font-medium flex items-center justify-center gap-2"
     },
     /* @__PURE__ */ React.createElement(Send, { className: "w-4 h-4" }),
     " ",
     submitting ? "Submitting\u2026" : "Submit report"
-  ), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: handleSaveNow,
-      disabled: submitting || saving,
-      className: "mt-2 w-full bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 text-slate-700 rounded-xl py-2.5 px-4 text-sm font-medium flex items-center justify-center gap-2"
-    },
-    /* @__PURE__ */ React.createElement(Save, { className: "w-4 h-4" }),
-    " ",
-    saving ? "Speichert\u2026" : "Jetzt speichern"
-  ), /* @__PURE__ */ React.createElement("div", { className: "mt-1.5 text-xs text-slate-500 text-center" }, "Speichert alles sofort \u2014 Notfall-Sicherung, falls das automatische Speichern fehlschl\xE4gt.")) : /* @__PURE__ */ React.createElement("div", { className: "bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-center space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "w-10 h-10 rounded-full bg-emerald-600 text-white flex items-center justify-center mx-auto" }, /* @__PURE__ */ React.createElement(Check, { className: "w-5 h-5" })), /* @__PURE__ */ React.createElement("div", { className: "mt-2 font-semibold text-emerald-900" }, "Report submitted"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-emerald-700 mt-1" }, "Your data is on the manager dashboard. ", /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Edits keep saving automatically"), " until midnight \u2014 no need to re-submit.")), /* @__PURE__ */ React.createElement(
-    "button",
-    {
-      onClick: handleSaveNow,
-      disabled: saving,
-      className: "w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-sm font-medium rounded-lg py-2 flex items-center justify-center gap-2"
-    },
-    /* @__PURE__ */ React.createElement(Save, { className: "w-4 h-4" }),
-    " ",
-    saving ? "Speichert\u2026" : "Jetzt speichern"
-  ), /* @__PURE__ */ React.createElement(
+  ) : /* @__PURE__ */ React.createElement("div", { className: "bg-emerald-50 border border-emerald-200 rounded-xl p-4 text-center space-y-3" }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "w-10 h-10 rounded-full bg-emerald-600 text-white flex items-center justify-center mx-auto" }, /* @__PURE__ */ React.createElement(Check, { className: "w-5 h-5" })), /* @__PURE__ */ React.createElement("div", { className: "mt-2 font-semibold text-emerald-900" }, "Report submitted"), /* @__PURE__ */ React.createElement("div", { className: "text-xs text-emerald-700 mt-1" }, "Your data is on the manager dashboard. ", /* @__PURE__ */ React.createElement("span", { className: "font-medium" }, "Edits keep saving automatically"), " until midnight \u2014 no need to re-submit.")), /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: () => setScreen("tracker-home"),
